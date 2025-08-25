@@ -14,11 +14,11 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'  # 设备
 
 dataset = MNIST()  # 数据集
 
-# model = DiT(img_size=28,patch_size=4,channel=1,emb_size=64,label_num=10,dit_num=3,head=4).to(DEVICE)
-model = UNet(img_channels=1, base_ch=64, channel_mults=(1, 2, 4), time_emb_dim=128, num_classes=10).to(DEVICE)
+model = DiT(img_size=28,patch_size=4,channel=1,emb_size=64,label_num=10,dit_num=3,head=4).to(DEVICE)
+# model = UNet(img_channels=1, base_ch=64, channel_mults=(1, 2, 4), time_emb_dim=128, num_classes=10).to(DEVICE)
 
 try:  # 加载模型
-    model.load_state_dict(torch.load('model/unet_model.pth'))
+    model.load_state_dict(torch.load('model/transformer_model.pth'))
 except:
     pass
 
@@ -39,12 +39,13 @@ def save_loss_plot(loss_list, plot_path):
 
 
 if __name__ == '__main__':
-    EPOCH = 100
+    # EPOCH = 100
+    EPOCH = 500
     BATCH_SIZE = 300
     T = 1000
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=6, persistent_workers=True)
-    model_path = 'model/unet_model.pth'
-    loss_plot_path = 'results/unet_loss.png'
+    model_path = 'model/transformer_model.pth'
+    loss_plot_path = 'results/transformer_loss.png'
     model.train()
     iter_count = 0
     # 初始化损失列表
@@ -68,8 +69,8 @@ if __name__ == '__main__':
 
             if iter_count % 1000 == 0:
                 print('epoch:{} iter:{},loss:{}'.format(epoch, iter_count, loss))
-                torch.save(model.state_dict(), path)
-                os.replace(path, path)
+                torch.save(model.state_dict(), model_path)
+                os.replace(model_path, model_path)
             iter_count += 1
 
     # 训练完成后，保存损失图

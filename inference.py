@@ -3,7 +3,7 @@ import torch
 from dit import DiT
 import matplotlib.pyplot as plt 
 from diffusion import *
-
+from unet import UNet
 DEVICE='cuda' if torch.cuda.is_available() else 'cpu' # 设备
 T = 1000
 def backward_denoise(model,x,y):
@@ -43,10 +43,15 @@ def backward_denoise(model,x,y):
     return steps
 
 if __name__ == '__main__':
-    model = DiT(image_size=28, embed_dim=64, patch_size=4, depth=3, num_heads=4, num_classes=10, out_channels=1).to(DEVICE)
+    # model = DiT(image_size=28, embed_dim=64, patch_size=4, depth=3, num_heads=4, num_classes=10, out_channels=1).to(DEVICE)
+    # model = DiT(img_size=28, patch_size=4, channel=1, emb_size=64, label_num=10, dit_num=3, head=4).to(DEVICE)
+    model = UNet(img_channels=1, base_ch=64, channel_mults=(1, 2, 4), time_emb_dim=128, num_classes=10).to(DEVICE)
     model_path = 'model/unet_model.pth'
+    # model_path = 'model/transformer_model.pth'
     model.load_state_dict(torch.load(model_path))
     inference_plot_path = 'results/unet_denoise.png'
+    # inference_plot_path = 'results/transformer_denoise.png'
+
     # 生成噪音图
     batch_size=10
     x=torch.randn(size=(batch_size,1,28,28))  # (5,1,24,24)
@@ -66,6 +71,7 @@ if __name__ == '__main__':
             final_img=final_img.permute(1,2,0)
             plt.subplot(batch_size,num_imgs,b*num_imgs+i+1)
             plt.imshow(final_img)
-    plt.show()
+
     plt.savefig(inference_plot_path)
+    plt.show()
     plt.close()
