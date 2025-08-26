@@ -24,6 +24,7 @@ variance = (1 - alphas) * (1 - alphas_cumprod_prev) / (1 - alphas_cumprod)
 # ==============
 def extract(a, t, x_shape):
     """从时间序列 a 中取出 batch 对应的值，并 reshape 成 [B,1,1,1]"""
+    a = a.to(t.device)  # 将 a 移动到与 t 相同的设备
     out = a.gather(0, t)
     return out.view((t.size(0),) + (1,) * (len(x_shape) - 1))
 
