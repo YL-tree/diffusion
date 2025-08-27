@@ -86,23 +86,39 @@ def posterior_logit(z_t, z_tm1, t, eps_pred):
     beta_tilde = (1.0 - a_bar_tm1) / (1.0 - a_bar_t) * b_t
 
     diff = z_tm1 - mu
-    logits = - (diff.pow(2).mean(dim=(1,2,3))) / (2.0 * beta_tilde.squeeze())
+    logits = - (diff.pow(2).sum(dim=(1,2,3))) / (2.0 * beta_tilde.view(-1))
     return logits
 
 @torch.no_grad()
 def posterior_probs(model, z_t, z_tm1, t, K, tau=1.0):
     """
     Softmax 得到类别后验分布 p(x|z_{t-1},z_t)
+    这里直接使用 MSE 损失作为对数似然项
     """
     B = z_t.size(0)
+    eps_eff = forward_add_noise_pair(z_tm1, t)[2] # 重新计算 eps_eff 以确保正确
+
     logits_all = []
     for k in range(K):
         yk = torch.full((B,), k, dtype=torch.long, device=z_t.device)
         eps_pred = model(z_t, t, yk)
-        logit_k = posterior_logit(z_t, z_tm1, t, eps_pred)
+        
+        # 使用 MSE 损失作为对数后验的近似
+        # 注意：这里是负号，因为我们希望损失越小，对数后验越大
+        mse_loss = F.mse_loss(eps_pred, eps_eff, reduction='none').sum(dim=(1, 2, 3))
+        logit_k = -mse_loss
+        
         logits_all.append(logit_k)
+        
     logits = torch.stack(logits_all, dim=1)  # [B,K]
-    return F.softmax(logits / tau, dim=1)    # [B,K]
+    
+    # 增加一个常量项，以匹配文献中的公式
+    # 这一步通常在实际实现中可以省略，因为 softmax 会处理相对值
+    # 但是，为了严谨，我们加上它
+    # C_t = ... （一个与t和beta有关的项）
+    # logits = logits + C_t
+    
+    return F.softmax(logits / tau, dim=1)
 
 
 

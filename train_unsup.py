@@ -64,18 +64,19 @@ if __name__ == '__main__':
             probs = posterior_probs(model, z_t, z_tm1, t, K, tau=1.0).detach()
 
             # Soft-EM 损失：对每个类的噪声预测误差，按后验加权
-            # per_class_losses = []
-            # for k in range(K):
-            #     yk = torch.full((x0.size(0),), k, dtype=torch.long, device=DEVICE)
-            #     eps_pred = model(z_t, t, yk)
-            #     per_pix = loss_fn(eps_pred, eps_eff)
-            #     w = probs[:, k].view(-1, 1, 1, 1)
-            #     per_class_losses.append((per_pix * w).mean())
+            per_class_losses = []
+            for k in range(K):
+                yk = torch.full((x0.size(0),), k, dtype=torch.long, device=DEVICE)
+                eps_pred = model(z_t, t, yk)
+                per_pix = loss_fn(eps_pred, eps_eff)
+                w = probs[:, k].view(-1, 1, 1, 1)
+                per_class_losses.append((per_pix * w).mean())
+            loss = torch.stack(per_class_losses).sum()
             
-            # Hard-EM 损失：直接最大化后验概率
-            k_star = probs.argmax(dim=1)  # [B]
-            eps_pred = model(z_t, t, k_star)
-            loss = loss_fn(eps_pred, eps_eff).mean()
+            # # Hard-EM 损失：直接最大化后验概率
+            # k_star = probs.argmax(dim=1)  # [B]
+            # eps_pred = model(z_t, t, k_star)
+            # loss = loss_fn(eps_pred, eps_eff).mean()
 
             optimizer.zero_grad()
             loss.backward()
