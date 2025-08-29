@@ -24,6 +24,15 @@ def save_loss_plot(loss_list, plot_path):
     plt.savefig(plot_path)
     plt.close()
 
+def save_entropy_plot(entropy_list, plot_path):
+    plt.figure(figsize=(10, 6))
+    plt.plot(entropy_list, label='Training Entropy')
+    plt.xlabel('Iterations')
+    plt.ylabel('Entropy')
+    plt.title('Training Entropy Over Time')
+    plt.legend()
+    plt.savefig(plot_path)
+    plt.close()
 # ======================
 # 训练主程序
 # ======================
@@ -32,15 +41,16 @@ if __name__ == '__main__':
     BATCH_SIZE = 200
     K = 10  # MNIST 类别数
     # 新增参数：从先验中生成标签的概率
-    unlabeled_prob = 0.3 
+    unlabeled_prob = 1
 
     dataset = MNIST()
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
     model = UNet(img_channels=1, base_ch=64, channel_mults=(1, 2, 4),
                  time_emb_dim=128, num_classes=K).to(DEVICE)
-    model_path = 'model/unet_unsup_semisup.pth'
-    loss_plot_path = 'results/unet_unsup_loss_semisup.png'
+    model_path = 'model/unet_unsup.pth'
+    loss_plot_path = 'results/unet_unsup_loss.png'
+    entropy_plot_path = 'results/unet_unsup_entropy.png'
 
     try:
         model.load_state_dict(torch.load(model_path))
@@ -55,6 +65,7 @@ if __name__ == '__main__':
     model.train()
     iter_count = 0
     loss_list = []
+    entropy_list = []
 
     for epoch in tqdm(range(EPOCH), desc='Training', unit='epoch'):
         for imgs, labels in dataloader:
@@ -92,11 +103,10 @@ if __name__ == '__main__':
                 # Hard-EM：选择后验概率最大的类别作为伪标签
                 pseudo_labels = unlabeled_probs.argmax(dim=1)
                 y_train[unlabeled_mask] = pseudo_labels
-            
+    
             # 3. M-步：使用组合好的 y_train 进行一次统一的训练
             eps_pred = model(z_t, t, y_train)
             loss = loss_fn(eps_pred, eps_eff).mean()
-
 
             # # Soft-EM 损失：对每个类的噪声预测误差，按后验加权
             # per_class_losses = []
@@ -108,8 +118,6 @@ if __name__ == '__main__':
             #     per_class_losses.append((per_pix * w).mean())
             # loss = torch.stack(per_class_losses).sum()
             
-
-
             # 1. E-步：计算类别后验分布
             # 注意：这里我们使用你修改后的 posterior_probs，它应该能更好地工作
             # probs = posterior_probs(model, z_t, z_tm1, t, K, tau=0.5).detach()
@@ -119,11 +127,11 @@ if __name__ == '__main__':
             # eps_pred = model(z_t, t, k_star)
             # loss = loss_fn(eps_pred, eps_eff).mean()
 
-
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             loss_list.append(loss.item())
+            entropy_list.append(entropy)
 
             if iter_count % 1000 == 0:
                 torch.save(model.state_dict(), model_path)
@@ -135,3 +143,4 @@ if __name__ == '__main__':
             iter_count += 1
 
     save_loss_plot(loss_list, loss_plot_path)
+    save_entropy_plot(entropy_list, entropy_plot_path)
