@@ -131,13 +131,13 @@ def posterior_logit(z_t, z_tm1, t, eps_pred):
     return logits
 
 @torch.no_grad()
-def posterior_probs(model, z_t, z_tm1, t, K, tau=1.0):
+def posterior_probs(model, z_t, z_tm1, t, K, eps_eff, tau=1.0):
     """
     Softmax 得到类别后验分布 p(x|z_{t-1},z_t)
     这里直接使用 MSE 损失作为对数似然项
     """
     B = z_t.size(0)
-    eps_eff = forward_add_noise_pair(z_tm1, t)[2] # 重新计算 eps_eff 以确保正确
+    # eps_eff = forward_add_noise_pair(z_tm1, t)[2] # 重新计算 eps_eff 以确保正确
 
     logits_all = []
     for k in range(K):
@@ -147,7 +147,7 @@ def posterior_probs(model, z_t, z_tm1, t, K, tau=1.0):
         # 使用 MSE 损失作为对数后验的近似
         # 注意：这里是负号，因为我们希望损失越小，对数后验越大
         mse_loss = F.mse_loss(eps_pred, eps_eff, reduction='none').sum(dim=(1, 2, 3))
-        logit_k = -mse_loss
+        logit_k = -mse_loss * 0.001
         
         logits_all.append(logit_k)
         

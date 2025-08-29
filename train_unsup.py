@@ -91,6 +91,7 @@ if __name__ == '__main__':
                         z_tm1[unlabeled_mask],
                         t[unlabeled_mask],
                         K,
+                        eps_eff,
                         tau=0.5
                     )
                 # M步：计算无标签样本的损失，按后验加权
@@ -134,7 +135,7 @@ if __name__ == '__main__':
                 torch.save(model.state_dict(), model_path)
                 with torch.no_grad():
                     # 在这里使用完整的批次来计算熵
-                    all_probs = posterior_probs(model, z_t, z_tm1, t, K, tau=0.5)
+                    all_probs = posterior_probs(model, z_t, z_tm1, t, K, eps_eff, tau=0.5)
                     entropy = -(all_probs * (all_probs.clamp_min(1e-12).log())).sum(dim=1).mean().item()
                     entropy_list.append(entropy)
                 print(f"epoch {epoch}, iter {iter_count}, loss {total_loss.item():.4f}, posterior entropy {entropy:.3f}")
