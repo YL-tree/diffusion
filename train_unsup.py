@@ -74,8 +74,8 @@ if __name__ == '__main__':
             # 1. 处理有标签的样本
             if labeled_mask.any():
                 # 对于有标签的样本，直接使用它们的真实标签进行训练
-                y_train[labeled_mask] = labels[labeled_mask].to(DEVICE)
-
+                y_train[labeled_mask] = labels[labeled_mask.cpu()].to(DEVICE)
+                
             # 2. 处理无标签的样本
             if unlabeled_mask.any():
                 # E-步：计算无标签样本的后验概率

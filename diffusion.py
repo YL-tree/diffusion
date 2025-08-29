@@ -48,25 +48,66 @@ def forward_add_noise_pair(x0, t):
     """
     给定原始图像 x0 和时间步 t (t >= 1)，生成一对 (z_{t-1}, z_t)，以及等效噪声 eps_eff
     用于计算类别后验 p(x|z_{t-1}, z_t)
+    
+    这个版本严格按照文档，区分了 t=1 和 t>1 的情况
     """
     B = x0.size(0)
-    eps = torch.randn_like(x0)       # 用于 z_{t-1}
-    eps_star = torch.randn_like(x0)  # 用于 z_t
+    # 将噪声张量移动到输入数据所在设备
+    eps_star = torch.randn_like(x0, device=x0.device) # 用于 z_t
+    
+    # 区分 t=1 和 t>1 的情况
+    is_t1_mask = (t == 1)
+    
+    # ------------------- 处理 t > 1 的情况 -------------------
+    # 在非 t=1 的样本上操作
+    t_greater_1 = t[~is_t1_mask]
+    x0_greater_1 = x0[~is_t1_mask]
+    eps_star_greater_1 = eps_star[~is_t1_mask]
+    
+    # 采样 eps 并确保在同一设备
+    eps_greater_1 = torch.randn_like(x0_greater_1, device=x0.device)
+    
+    # 提取相应的参数 - 显式指定设备为x0.device
+    a_bar_tm1_greater_1 = extract(alphas_cumprod.to(x0.device), t_greater_1 - 1, x0_greater_1.shape)
+    a_t_greater_1 = extract(alphas.to(x0.device), t_greater_1, x0_greater_1.shape)
+    
+    # 计算 z_{t-1} 和 z_t
+    z_tm1_greater_1 = torch.sqrt(a_bar_tm1_greater_1) * x0_greater_1 + torch.sqrt(1.0 - a_bar_tm1_greater_1) * eps_greater_1
+    z_t_greater_1 = torch.sqrt(a_t_greater_1) * z_tm1_greater_1 + torch.sqrt(1.0 - a_t_greater_1) * eps_star_greater_1
 
-    a_bar_tm1 = extract(alphas_cumprod, t-1, x0.shape)
-    a_t       = extract(alphas, t, x0.shape)
-    a_bar_t   = extract(alphas_cumprod, t, x0.shape)
+    # 计算等效噪声 eps_eff
+    a_bar_t_greater_1 = extract(alphas_cumprod.to(x0.device), t_greater_1, x0_greater_1.shape)
+    one_m_a_bar_t_greater_1 = 1.0 - a_bar_t_greater_1
+    
+    eps_eff_greater_1 = ( torch.sqrt(a_t_greater_1) * torch.sqrt(1.0 - a_bar_tm1_greater_1) * eps_greater_1
+                        + torch.sqrt(1.0 - a_t_greater_1) * eps_star_greater_1 ) / torch.sqrt(one_m_a_bar_t_greater_1)
 
-    # z_{t-1} = sqrt(\bar{a}_{t-1}) x0 + sqrt(1-\bar{a}_{t-1}) eps
-    z_tm1 = torch.sqrt(a_bar_tm1) * x0 + torch.sqrt(1.0 - a_bar_tm1) * eps
+    # ------------------- 处理 t = 1 的情况 -------------------
+    # 确保零张量在正确设备上
+    z_tm1_t1 = torch.zeros_like(x0[is_t1_mask], device=x0.device) # z_{t-1} 在 t=1 时不存在，可以设为零或不使用
+    
+    a_t_t1 = extract(alphas.to(x0.device), t[is_t1_mask], x0[is_t1_mask].shape)
+    
+    # 文档中的 t=1 公式
+    z_t_t1 = torch.sqrt(1.0 - a_t_t1) * x0[is_t1_mask] + torch.sqrt(a_t_t1) * eps_star[is_t1_mask]
+    
+    # 文档中 t=1 的等效噪声
+    eps_eff_t1 = eps_star[is_t1_mask]
 
-    # z_t = sqrt(alpha_t) z_{t-1} + sqrt(1-alpha_t) eps_star
-    z_t = torch.sqrt(a_t) * z_tm1 + torch.sqrt(1.0 - a_t) * eps_star
-
-    # 等效噪声 eps_eff 使得 z_t = sqrt(\bar{a}_t)x0 + sqrt(1-\bar{a}_t) eps_eff
-    one_m_a_bar_t = 1.0 - a_bar_t
-    eps_eff = ( torch.sqrt(a_t) * torch.sqrt(1.0 - a_bar_tm1) * eps
-              + torch.sqrt(1.0 - a_t) * eps_star ) / torch.sqrt(one_m_a_bar_t)
+    # ------------------- 拼接结果 -------------------
+    # 创建完整的张量并确保在正确设备上
+    z_t = torch.zeros_like(x0, device=x0.device)
+    z_tm1 = torch.zeros_like(x0, device=x0.device)
+    eps_eff = torch.zeros_like(x0, device=x0.device)
+    
+    # 填充结果
+    z_t[~is_t1_mask] = z_t_greater_1
+    z_tm1[~is_t1_mask] = z_tm1_greater_1
+    eps_eff[~is_t1_mask] = eps_eff_greater_1
+    
+    z_t[is_t1_mask] = z_t_t1
+    z_tm1[is_t1_mask] = z_tm1_t1
+    eps_eff[is_t1_mask] = eps_eff_t1
 
     return z_t, z_tm1, eps_eff
 
