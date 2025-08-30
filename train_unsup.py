@@ -37,20 +37,20 @@ def save_entropy_plot(entropy_list, plot_path):
 # 训练主程序
 # ======================
 if __name__ == '__main__':
-    EPOCH = 3
+    EPOCH = 300
     BATCH_SIZE = 200
     K = 10  # MNIST 类别数
     # 新增参数：从先验中生成标签的概率
-    unlabeled_prob = 0.5
+    unlabeled_prob = 0
 
     dataset = MNIST()
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
     model = UNet(img_channels=1, base_ch=64, channel_mults=(1, 2, 4),
                  time_emb_dim=128, num_classes=K).to(DEVICE)
-    model_path = 'model/unet_semisup_0.5.pth'
-    loss_plot_path = 'results/unet_semisup_0.5_loss.png'
-    entropy_plot_path = 'results/unet_semisup_0.5_entropy.png'
+    model_path = 'model/unet.pth'
+    loss_plot_path = 'results/unet_loss.png'
+    entropy_plot_path = 'results/unet_entropy.png'
 
     try:
         model.load_state_dict(torch.load(model_path, weights_only=False))
@@ -59,7 +59,7 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Error loading model: {e}, starting from scratch.")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     loss_fn = nn.MSELoss(reduction='none')  # 用 MSE，和 DDPM 一致
 
     model.train()
@@ -71,7 +71,7 @@ if __name__ == '__main__':
         for imgs, labels in dataloader:
             x0 = imgs.to(DEVICE) * 2 - 1
             labels = labels.to(DEVICE)
-            t = torch.randint(1, T, (x0.size(0),), device=DEVICE).long()
+            t = torch.randint(1, T + 1, (x0.size(0),), device=DEVICE).long()
             
             z_t, z_tm1, eps_eff = forward_add_noise_pair(x0, t)
 
@@ -91,7 +91,7 @@ if __name__ == '__main__':
                         z_tm1[unlabeled_mask],
                         t[unlabeled_mask],
                         K,
-                        eps_eff,
+                        eps_eff[unlabeled_mask],
                         tau=0.5
                     )
                 # M步：计算无标签样本的损失，按后验加权
@@ -130,14 +130,14 @@ if __name__ == '__main__':
             total_loss.backward()
             optimizer.step()
             loss_list.append(total_loss.item())
+            with torch.no_grad():
+                # 在这里使用完整的批次来计算熵
+                all_probs = posterior_probs(model, z_t, z_tm1, t, K, eps_eff, tau=0.5)
+                entropy = -(all_probs * (all_probs.clamp_min(1e-12).log())).sum(dim=1).mean().item()
+                entropy_list.append(entropy)
 
             if iter_count % 1000 == 0:
                 torch.save(model.state_dict(), model_path)
-                with torch.no_grad():
-                    # 在这里使用完整的批次来计算熵
-                    all_probs = posterior_probs(model, z_t, z_tm1, t, K, eps_eff, tau=0.5)
-                    entropy = -(all_probs * (all_probs.clamp_min(1e-12).log())).sum(dim=1).mean().item()
-                    entropy_list.append(entropy)
                 print(f"epoch {epoch}, iter {iter_count}, loss {total_loss.item():.4f}, posterior entropy {entropy:.3f}")
             iter_count += 1
             

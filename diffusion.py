@@ -24,8 +24,9 @@ variance = (1 - alphas) * (1 - alphas_cumprod_prev) / (1 - alphas_cumprod)
 # ==============
 def extract(a, t, x_shape):
     """从时间序列 a 中取出 batch 对应的值，并 reshape 成 [B,1,1,1]"""
-    a = a.to(t.device)  # 将 a 移动到与 t 相同的设备
-    out = a.gather(0, t)
+    a = a.to(t.device)
+    idx = (t - 1).clamp(min=0)  # t=1 → idx=0
+    out = a.gather(0, idx)
     return out.view((t.size(0),) + (1,) * (len(x_shape) - 1))
 
 # =====================
@@ -68,7 +69,7 @@ def forward_add_noise_pair(x0, t):
     eps_greater_1 = torch.randn_like(x0_greater_1, device=x0.device)
     
     # 提取相应的参数 - 显式指定设备为x0.device
-    a_bar_tm1_greater_1 = extract(alphas_cumprod.to(x0.device), t_greater_1 - 1, x0_greater_1.shape)
+    a_bar_tm1_greater_1 = extract(alphas_cumprod_prev.to(x0.device), t_greater_1, x0_greater_1.shape)
     a_t_greater_1 = extract(alphas.to(x0.device), t_greater_1, x0_greater_1.shape)
     
     # 计算 z_{t-1} 和 z_t
@@ -89,7 +90,7 @@ def forward_add_noise_pair(x0, t):
     a_t_t1 = extract(alphas.to(x0.device), t[is_t1_mask], x0[is_t1_mask].shape)
     
     # 文档中的 t=1 公式
-    z_t_t1 = torch.sqrt(1.0 - a_t_t1) * x0[is_t1_mask] + torch.sqrt(a_t_t1) * eps_star[is_t1_mask]
+    z_t_t1 = torch.sqrt(a_t_t1) * x0[is_t1_mask] + torch.sqrt(1.0 - a_t_t1) * eps_star[is_t1_mask]
     
     # 文档中 t=1 的等效噪声
     eps_eff_t1 = eps_star[is_t1_mask]
@@ -121,7 +122,7 @@ def posterior_logit(z_t, z_tm1, t, eps_pred):
     a_t = extract(alphas, t, z_t.shape)
     b_t = extract(betas, t, z_t.shape)
     a_bar_t = extract(alphas_cumprod, t, z_t.shape)
-    a_bar_tm1 = extract(alphas_cumprod, t-1, z_t.shape)
+    a_bar_tm1 = extract(alphas_cumprod_prev, t, z_t.shape)
 
     mu = (1.0 / torch.sqrt(a_t)) * (z_t - (b_t / torch.sqrt(1.0 - a_bar_t)) * eps_pred)
     beta_tilde = (1.0 - a_bar_tm1) / (1.0 - a_bar_t) * b_t
@@ -131,35 +132,52 @@ def posterior_logit(z_t, z_tm1, t, eps_pred):
     return logits
 
 @torch.no_grad()
-def posterior_probs(model, z_t, z_tm1, t, K, eps_eff, tau=1.0):
-    """
-    Softmax 得到类别后验分布 p(x|z_{t-1},z_t)
-    这里直接使用 MSE 损失作为对数似然项
-    """
+def posterior_probs(model, z_t, z_tm1, t, K, eps_eff, tau=1.0, log_prior=None, use_decoder_at_t1=True):
+    # ---------- 情况 1: t > 1 ----------
+    mask = (t > 1)
     B = z_t.size(0)
-    # eps_eff = forward_add_noise_pair(z_tm1, t)[2] # 重新计算 eps_eff 以确保正确
+    device = z_t.device
 
-    logits_all = []
-    for k in range(K):
-        yk = torch.full((B,), k, dtype=torch.long, device=z_t.device)
-        eps_pred = model(z_t, t, yk)
-        
-        # 使用 MSE 损失作为对数后验的近似
-        # 注意：这里是负号，因为我们希望损失越小，对数后验越大
-        mse_loss = F.mse_loss(eps_pred, eps_eff, reduction='none').sum(dim=(1, 2, 3))
-        logit_k = -mse_loss * 0.001
-        
-        logits_all.append(logit_k)
-        
-    logits = torch.stack(logits_all, dim=1)  # [B,K]
-    
-    # 增加一个常量项，以匹配文献中的公式
-    # 这一步通常在实际实现中可以省略，因为 softmax 会处理相对值
-    # 但是，为了严谨，我们加上它
-    # C_t = ... （一个与t和beta有关的项）
-    # logits = logits + C_t
-    
-    return F.softmax(logits / tau, dim=1)
+    logits_full = torch.zeros(B, K, device=device)
+
+    if mask.any():
+        z_t_m   = z_t[mask]
+        z_tm1_m = z_tm1[mask]
+        t_m     = t[mask]
+
+        logits_list = []
+        for k in range(K):
+            yk = torch.full((z_t_m.size(0),), k, dtype=torch.long, device=device)
+            eps_pred = model(z_t_m, t_m, yk)
+            logit_k = posterior_logit(z_t_m, z_tm1_m, t_m, eps_pred)  # [Bm]
+            logits_list.append(logit_k)
+
+        logits_m = torch.stack(logits_list, dim=1)  # [Bm, K]
+        if log_prior is not None:
+            logits_m = logits_m + log_prior.view(1, K)  # 加上先验的 log π_k（若非均匀）
+
+        logits_full[mask] = logits_m
+
+    # ---------- 情况 2: t = 1 ----------
+    mask_t1 = (t == 1)
+    if use_decoder_at_t1 and mask_t1.any():
+        z_t1   = z_t[mask_t1]
+        eps_t1 = eps_eff[mask_t1]  # 这一步的等效噪声
+
+        logits_list = []
+        for k in range(K):
+            yk = torch.full((z_t1.size(0),), k, dtype=torch.long, device=device)
+            eps_pred = model(z_t1, t[mask_t1], yk)
+            # 直接用 -MSE 作为 decoder likelihood 的 proxy
+            mse = F.mse_loss(eps_pred, eps_t1, reduction="none").sum(dim=(1,2,3))
+            logits_k = -mse
+            logits_list.append(logits_k)
+
+        logits_full[mask_t1] = torch.stack(logits_list, dim=1)
+
+    # ---------- Softmax ----------
+    probs = F.softmax(logits_full / tau, dim=1)
+    return probs
 
 
 
