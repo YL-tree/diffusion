@@ -17,43 +17,37 @@ def _group_norm(c: int, max_groups: int = 32) -> nn.GroupNorm:
 
 
 # ---- Building Blocks with AdaGN-style conditioning ----
+# --- ResBlock (Modified) ---
 class ResBlock(nn.Module):
+    # The only change is the cond_emb_dim, the rest of the logic is the same
     def __init__(self, in_ch: int, out_ch: int, cond_emb_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.in_ch = in_ch
-        self.out_ch = out_ch
-
-        # first norm/conv
+        # ... (norm1, act1, conv1 are the same) ...
         self.norm1 = _group_norm(in_ch)
         self.act1 = nn.SiLU()
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
 
-        # conditioning projections produce scale/shift for norm1 and norm2
-        # we produce two pairs (scale1, shift1) and (scale2, shift2)
-        self.cond_proj1 = nn.Linear(cond_emb_dim, out_ch * 2)  # scale1, shift1
-        self.cond_proj2 = nn.Linear(cond_emb_dim, out_ch * 2)  # scale2, shift2
+        # IMPORTANT: The input dimension here will be larger after concatenation
+        self.cond_proj1 = nn.Linear(cond_emb_dim, out_ch * 2)
+        self.cond_proj2 = nn.Linear(cond_emb_dim, out_ch * 2)
 
-        # second norm/conv
+        # ... (the rest of the __init__ and forward method are identical to your original code) ...
         self.norm2 = _group_norm(out_ch)
         self.act2 = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
-
-        # shortcut for residual
         self.shortcut = nn.Conv2d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
 
     def forward(self, x: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
-        # norm1 -> activation -> conv1 (change channels first)
+        # This forward pass does not need to change at all.
         h = self.norm1(x)
         h = self.act1(h)
         h = self.conv1(h)
         
-        # Now apply conditional scaling (h has out_ch channels)
         cs1 = self.cond_proj1(cond_emb)
-        scale1, shift1 = cs1.chunk(2, dim=1)  # each [B, out_ch]
+        scale1, shift1 = cs1.chunk(2, dim=1)
         h = h * (1 + scale1[:, :, None, None]) + shift1[:, :, None, None]
 
-        # norm2 -> apply scale/shift from cond_proj2
         h = self.norm2(h)
         cs2 = self.cond_proj2(cond_emb)
         scale2, shift2 = cs2.chunk(2, dim=1)
@@ -63,7 +57,6 @@ class ResBlock(nn.Module):
         h = self.conv2(h)
 
         return h + self.shortcut(x)
-
 
 class DownBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, cond_emb_dim: int):
@@ -116,7 +109,7 @@ class UNet(nn.Module):
         self.img_channels = img_channels
         self.time_emb_dim = time_emb_dim
 
-        # time embedding MLP (produce vector of dim time_emb_dim)
+        # time embedding
         self.time_mlp = nn.Sequential(
             TimeEmbedding(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim * 4),
@@ -124,8 +117,18 @@ class UNet(nn.Module):
             nn.Linear(time_emb_dim * 4, time_emb_dim),
         )
 
-        # class embedding (separate, same dim). Keep it optional.
-        self.class_emb = nn.Embedding(num_classes, time_emb_dim) if num_classes is not None else None
+        # class embedding
+        if num_classes is not None:
+            self.class_emb = nn.Embedding(num_classes, time_emb_dim)
+            # concat 后过一层 MLP，再压回 time_emb_dim
+            self.cond_mlp = nn.Sequential(
+                nn.Linear(2 * time_emb_dim, time_emb_dim),
+                nn.SiLU(),
+                nn.Linear(time_emb_dim, time_emb_dim),
+            )
+        else:
+            self.class_emb = None
+            self.cond_mlp = None
 
         # input stem
         self.init_conv = nn.Conv2d(img_channels, base_ch, kernel_size=3, padding=1)
@@ -136,7 +139,7 @@ class UNet(nn.Module):
         self.skip_chs: List[int] = []
         for mult in channel_mults:
             out_ch = base_ch * mult
-            downs.append(DownBlock(ch, out_ch, time_emb_dim))
+            downs.append(DownBlock(ch, out_ch, time_emb_dim))  # cond_emb_dim = time_emb_dim
             self.skip_chs.append(out_ch)
             ch = out_ch
         self.downs = nn.ModuleList(downs)
@@ -145,7 +148,7 @@ class UNet(nn.Module):
         self.mid1 = ResBlock(ch, ch, time_emb_dim, dropout)
         self.mid2 = ResBlock(ch, ch, time_emb_dim, dropout)
 
-        # decoder (mirror of encoder)
+        # decoder
         ups: List[UpBlock] = []
         for skip_ch in reversed(self.skip_chs):
             out_ch = skip_ch
@@ -159,18 +162,14 @@ class UNet(nn.Module):
         self.final_conv = nn.Conv2d(ch, img_channels, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        x: [B, C, H, W]
-        t: [B] (long or float indices) -> will be processed by time_mlp (TimeEmbedding expects ints)
-        y: [B] optional class indices
-        """
-        # time emb vector
+        # time embedding
         t_emb = self.time_mlp(t)  # [B, time_emb_dim]
 
-        # class embedding (if present) - keep separate and add (this is now strong because ResBlock uses cond_proj)
+        # class embedding
         if self.class_emb is not None and y is not None:
             c_emb = self.class_emb(y)  # [B, time_emb_dim]
-            cond = t_emb + c_emb
+            cond = torch.cat([t_emb, c_emb], dim=1)  # [B, 2*dim]
+            cond = self.cond_mlp(cond)  # [B, time_emb_dim]
         else:
             cond = t_emb
 
@@ -185,11 +184,11 @@ class UNet(nn.Module):
         x = self.mid1(x, cond)
         x = self.mid2(x, cond)
 
-        # decoder (use reversed skips)
+        # decoder
         for up, skip in zip(self.ups, reversed(skips)):
             x = up(x, skip, cond)
 
-        # final output
+        # output
         x = self.final_conv(self.final_act(self.final_norm(x)))
         return x
 
