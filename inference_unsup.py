@@ -36,18 +36,28 @@ def p_sample(model, z_t, t, y_class):
 @torch.no_grad()
 def sample(model, n_samples=16, given_class=None, K=10):
     """
-    从模型采样
-    - given_class: 如果指定，则所有样本用该类；否则从均匀先验采样类
+    采样过程（和 Mixture of Diffusion 论文一致）
+    - given_class: 如果指定，则所有样本固定为该类
+    - 如果为 None，则从均匀分布先验中采样一次类别，并在整个反向扩散过程中保持不变
     """
-    z_t = torch.randn(n_samples, 1, 28, 28).to(DEVICE)  # 初始噪声
+    # 1. 初始噪声
+    z_t = torch.randn(n_samples, 1, 28, 28, device=DEVICE)
+
+    # 2. 类别采样
+    if given_class is None:
+        # 从 prior (均匀分布) 一次性采样类别
+        y_class = torch.randint(0, K, (n_samples,), device=DEVICE)
+    else:
+        # 固定为指定类别
+        y_class = torch.full((n_samples,), given_class, device=DEVICE)
+
+    # 3. 反向扩散
     for t_step in reversed(range(T)):
         t_tensor = torch.full((n_samples,), t_step, device=DEVICE, dtype=torch.long)
-        if given_class is None:
-            y_class = torch.randint(0, K, (n_samples,), device=DEVICE)
-        else:
-            y_class = torch.full((n_samples,), given_class, device=DEVICE)
         z_t = p_sample(model, z_t, t_tensor, y_class)
-    return z_t
+
+    return z_t, y_class
+
 
 # ======================
 # 可视化函数

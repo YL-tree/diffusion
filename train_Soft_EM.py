@@ -37,7 +37,7 @@ def save_entropy_plot(entropy_list, plot_path):
 # 训练主程序
 # ======================
 if __name__ == '__main__':
-    EPOCH = 300
+    EPOCH = 100
     BATCH_SIZE = 200
     K = 10  # MNIST 类别数
     # 新增参数：从先验中生成标签的概率
