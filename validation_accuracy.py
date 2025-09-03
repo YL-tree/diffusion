@@ -98,9 +98,6 @@ if __name__ == '__main__':
     BATCH_SIZE = 128  # 验证时可以使用稍大的 batch size
     MODEL_PATH = 'model/unet.pth' 
 
-    dataset = MNIST()
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-
     # ==================
     # 2. 加载模型
     # ==================
@@ -116,11 +113,8 @@ if __name__ == '__main__':
     # ==================
     # 3. 准备验证数据
     # ==================
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-    val_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    val_dataset = MNIST(is_train=False)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
     # ==================
     # 4. 定义要测试的时间步
