@@ -9,7 +9,12 @@ import matplotlib.pyplot as plt
 from unet import UNet
 from diffusion import T, forward_add_noise_pair, posterior_probs, posterior_logit
 
+#----- 网格搜索完成 -----
+#最佳 Lambda: 0.2
+#对应的最高验证集准确率: 98.28%
+
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {DEVICE}")
 
 # ======================
 # 辅助函数
@@ -25,24 +30,41 @@ def save_loss_plot(loss_list, plot_name):
     plt.close()
 
 def calculate_differentiable_logits(model, z_t, z_tm1, t, K):
-    """
-    一个可微分的函数，用于计算分类损失所需的 logits。
-    去掉了 @torch.no_grad() 装饰器。
-    """
     device = z_t.device
-    logits_list = []
-    for k in range(K):
-        yk = torch.full((z_t.size(0),), k, dtype=torch.long, device=device)
+    logits_list = torch.zeros(z_t.size(0), K, device=device)
+    
+    # 获取 t > 1 和 t = 1 的掩码
+    is_t_gt_1 = (t > 1)
+    is_t_eq_1 = (t == 1)
+    
+    # ==========================
+    # 对 t > 1 的样本进行处理
+    # ==========================
+    if is_t_gt_1.any():
+        z_t_gt1 = z_t[is_t_gt_1]
+        z_tm1_gt1 = z_tm1[is_t_gt_1]
+        t_gt1 = t[is_t_gt_1]
         
-        # 梯度将从这里流过
-        eps_pred_k = model(z_t, t, yk)
+        logits_gt1 = torch.zeros(z_t_gt1.size(0), K, device=device)
+        for k in range(K):
+            yk = torch.full((z_t_gt1.size(0),), k, dtype=torch.long, device=device)
+            eps_pred_k = model(z_t_gt1, t_gt1, yk)
+            logit_k = posterior_logit(z_t_gt1, z_tm1_gt1, t_gt1, eps_pred_k)
+            logits_gt1[:, k] = logit_k
         
-        # 调用核心的 logit 计算
-        logit_k = posterior_logit(z_t, z_tm1, t, eps_pred_k)
-        logits_list.append(logit_k)
+        logits_list[is_t_gt_1] = logits_gt1
 
-    logits = torch.stack(logits_list, dim=1)  # [BatchSize, K]
-    return logits
+    # ==========================
+    # 对 t = 1 的样本进行特殊处理
+    # ==========================
+    if is_t_eq_1.any():
+        # 这里你可以选择跳过这个样本，或者用一个小的常数/0来避免NaN。
+        # 最简单粗暴的方法是：对这些样本的CE Loss贡献为0，不参与CE损失计算。
+        # 也就是让它们的 logits 变为 0，这样 ce_loss_fn 在计算时就会忽略它们。
+        logits_eq1 = torch.zeros(z_t[is_t_eq_1].size(0), K, device=device)
+        logits_list[is_t_eq_1] = logits_eq1
+
+    return logits_list
 
 # ======================
 # 验证函数 (新增)
@@ -154,6 +176,9 @@ if __name__ == '__main__':
                 optimizer.step()
                 loss_list.append(loss.item())
                 mse_loss_list.append(mse_loss.item())
+            
+            if epoch % 4 == 0:
+                print(f"Epoch {epoch+1}/{EPOCH}, Loss: {loss.item():.4f}, MSE Loss: {mse_loss.item():.4f}, CE Loss: {ce_loss.item():.4f}")
         
         # --- 步骤四：验证模型 ---
         val_accuracy = validate_model(model, val_loader, K)
