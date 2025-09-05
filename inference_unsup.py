@@ -82,16 +82,17 @@ def save_images(samples, path, nrow=4):
 if __name__ == "__main__":
     K = 10
     model = UNet(img_channels=1, base_ch=64, channel_mults=(1,2,4), time_emb_dim=128, num_classes=K).to(DEVICE)
-    model.load_state_dict(torch.load("model/unet_unsup.pth", map_location=DEVICE))
+    model.load_state_dict(torch.load("model/unet_best.pth", weights_only=False, map_location=DEVICE))
     model.eval()
-
-    os.makedirs("samples", exist_ok=True)
+    
+    sample_path = "samples/best"
+    os.makedirs(sample_path, exist_ok=True)
 
     # 1. 不指定类别（从先验采样）
-    samples = sample(model, n_samples=16, given_class=None, K=K)
-    save_images(samples, "samples/sample_random.png")
+    samples, y_class = sample(model, n_samples=16, given_class=None, K=K)
+    save_images(samples, f"{sample_path}/sample_random.png")
 
     # 2. 指定每个类别采样（可检查每类学到了什么）
     for cls in range(K):
-        samples = sample(model, n_samples=16, given_class=cls, K=K)
-        save_images(samples, f"samples/sample_class_{cls}.png")
+        samples, _ = sample(model, n_samples=16, given_class=cls, K=K)
+        save_images(samples, f"{sample_path}/sample_class_{cls}.png")

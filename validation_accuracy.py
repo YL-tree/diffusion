@@ -95,7 +95,7 @@ if __name__ == '__main__':
     # ==================
     # 1. 参数设置
     # ==================
-    BATCH_SIZE = 128  # 验证时可以使用稍大的 batch size
+    BATCH_SIZE = 256  
     MODEL_PATH = 'model/unet.pth' 
 
     # ==================

@@ -14,25 +14,16 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # ======================
 # 辅助函数
 # ======================
-def save_loss_plot(loss_list, plot_path):
+def save_loss_plot(loss_list, plot_name):
     plt.figure(figsize=(10, 6))
-    plt.plot(loss_list, label='Training Loss')
+    plt.plot(loss_list, label=f'Training {plot_name}')
     plt.xlabel('Iterations')
-    plt.ylabel('Loss')
-    plt.title('Training Loss Over Time')
+    plt.ylabel(f'{plot_name}')
+    plt.title(f'Training {plot_name} Over Time')
     plt.legend()
-    plt.savefig(plot_path)
+    plt.savefig(f'results/unet_{plot_name}.png')
     plt.close()
 
-def save_entropy_plot(entropy_list, plot_path):
-    plt.figure(figsize=(10, 6))
-    plt.plot(entropy_list, label='Training Entropy')
-    plt.xlabel('Iterations')
-    plt.ylabel('Entropy')
-    plt.title('Training Entropy Over Time')
-    plt.legend()
-    plt.savefig(plot_path)
-    plt.close()
 # ======================
 # 训练主程序
 # ======================
@@ -49,9 +40,6 @@ if __name__ == '__main__':
     model = UNet(img_channels=1, base_ch=64, channel_mults=(1, 2, 4),
                  time_emb_dim=128, num_classes=K).to(DEVICE)
     model_path = 'model/unet.pth'
-    loss_plot_path = 'results/unet_loss.png'
-    entropy_plot_path = 'results/unet_entropy.png'
-
     try:
         model.load_state_dict(torch.load(model_path, weights_only=False))
     except FileNotFoundError:
@@ -59,14 +47,19 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Error loading model: {e}, starting from scratch.")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     loss_fn = nn.MSELoss(reduction='none')  # 用 MSE，和 DDPM 一致
+    loss_plot_name = 'loss'
+    entropy_plot_name = 'entropy'
 
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    
     model.train()
     iter_count = 0
     loss_list = []
     entropy_list = []
-        
+
+    print(f"Starting training with unlabeled_prob = {unlabeled_prob}")
+
     for epoch in tqdm(range(EPOCH), desc='Training', unit='epoch'):
         for imgs, labels in dataloader:
             x0 = imgs.to(DEVICE) * 2 - 1
@@ -80,21 +73,21 @@ if __name__ == '__main__':
 
             # 最终用于模型训练的标签
             y_train = torch.zeros_like(labels)
-            
             # 1. 处理无标签样本 (Stochastic EM / Hard EM)
             if unlabeled_mask.any():
                 # E-step：计算后验概率
+                # 使用t=1计算后验概率
+                t_unlabeled = torch.ones_like(t[unlabeled_mask])  # 全部设为 1
+                z_t_unlabeled, z_tm1_unlabeled, eps_eff_unlabeled = forward_add_noise_pair(x0[unlabeled_mask], t_unlabeled)
                 with torch.no_grad():
                     unlabeled_probs = posterior_probs(
                         model,
-                        z_t[unlabeled_mask],
-                        z_tm1[unlabeled_mask],
-                        t[unlabeled_mask],
+                        z_t_unlabeled,
+                        z_tm1_unlabeled,
+                        t_unlabeled,
                         K,
-                        eps_eff[unlabeled_mask],
-                        tau=0.5 # tau 是一个可以调整的超参数
+                        eps_eff_unlabeled
                     )
-                
                 # M-step (Hard): 从后验分布中采样伪标签
                 # torch.multinomial 从每行的概率分布中采样一个索引
                 pseudo_labels = torch.multinomial(unlabeled_probs, num_samples=1).squeeze(1)
@@ -106,8 +99,6 @@ if __name__ == '__main__':
 
             # 3. 统一进行模型优化
             # 现在 y_train 包含了真实标签和伪标签
-            optimizer.zero_grad()
-            
             eps_pred = model(z_t, t, y_train)
             loss = loss_fn(eps_pred, eps_eff).mean() # 使用 .mean() 对整个批次的损失求平均
             
@@ -124,8 +115,8 @@ if __name__ == '__main__':
 
             if iter_count % 1000 == 0:
                 torch.save(model.state_dict(), model_path)
-                print(f"epoch {epoch}, iter {iter_count}, loss {total_loss.item():.4f}, posterior entropy {entropy:.3f}")
+                print(f"epoch {epoch}, iter {iter_count}, loss {loss.item():.4f}, posterior entropy {entropy:.3f}")
             iter_count += 1
             
-    save_loss_plot(loss_list, loss_plot_path)
-    save_entropy_plot(entropy_list, entropy_plot_path)
+    save_loss_plot(loss_list, loss_plot_name)
+    save_loss_plot(entropy_list, entropy_plot_name)
