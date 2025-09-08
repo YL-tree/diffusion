@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import matplotlib.pyplot as plt
+from config import T
 
 # =====================
 # Beta schedule
@@ -10,7 +11,6 @@ import matplotlib.pyplot as plt
 def make_beta_schedule(T, beta_start=1e-4, beta_end=2e-2):
     return torch.linspace(beta_start, beta_end, T)  # 线性调度
 
-T = 1000
 betas = make_beta_schedule(T)  # (T,)
 alphas = 1.0 - betas
 alphas_cumprod = torch.cumprod(alphas, dim=-1)  # \bar{alpha}_t

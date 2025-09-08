@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+from config import T
 
 # ===============================================================
 # 假设您的代码已经组织在以下文件中，请根据您的实际情况修改导入
@@ -14,6 +15,7 @@ from mnist_data import MNIST
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 K = 10 # 类别数
+# T = 1000
 
 # ===============================================================
 # 验证主程序
@@ -104,7 +106,7 @@ if __name__ == '__main__':
     model = UNet(img_channels=1, base_ch=64, channel_mults=(1, 2, 4),
                  time_emb_dim=128, num_classes=K).to(DEVICE)
     try:
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        model.load_state_dict(torch.load(MODEL_PATH, weights_only=False, map_location=DEVICE))
         print("Model loaded successfully.")
     except Exception as e:
         print(f"Error loading model: {e}")
