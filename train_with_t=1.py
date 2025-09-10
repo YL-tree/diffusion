@@ -14,21 +14,21 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # ======================
 # 辅助函数
 # ======================
-def save_loss_plot(loss_list, plot_name):
+def save_loss_plot(loss_list, plot_name, epoch):
     plt.figure(figsize=(10, 6))
     plt.plot(loss_list, label=f'Training {plot_name}')
     plt.xlabel('Iterations')
     plt.ylabel(f'{plot_name}')
     plt.title(f'Training {plot_name} Over Time')
     plt.legend()
-    plt.savefig(f'results/unet_{plot_name}.png')
+    plt.savefig(f'results/unet_{plot_name}_epoch={epoch}.png')
     plt.close()
 
 # ======================
 # 训练主程序
 # ======================
 if __name__ == '__main__':
-    EPOCH = 100
+    EPOCH = 300
     BATCH_SIZE = 200
     K = 10  # MNIST 类别数
     # 新增参数：从先验中生成标签的概率
@@ -41,9 +41,9 @@ if __name__ == '__main__':
                  time_emb_dim=128, num_classes=K).to(DEVICE)
     
     model_path = 'model/unet.pth'
-    model_save_path = 'model/unet_t=1_pretrain.pth'
-    loss_plot_name = 'loss_t=1_pretrain'
-    entropy_plot_name = 'entropy_t=1_pretrain'
+    model_save_path = 'model/unet_t=1.pth'
+    loss_plot_name = 'loss_t=1'
+    entropy_plot_name = 'entropy_t=1'
     
     try:
         model.load_state_dict(torch.load(model_path, weights_only=False))
@@ -118,9 +118,16 @@ if __name__ == '__main__':
                 entropy_list.append(entropy)
 
             if iter_count % 1000 == 0:
-                torch.save(model.state_dict(), model_save_path)
                 print(f"epoch {epoch}, iter {iter_count}, loss {loss.item():.4f}, posterior entropy {entropy:.3f}")
             iter_count += 1
+
+            # 每100epoch保存一次模型
+            if epoch % 100 == 0:
+                model_save_path = f'model/unet_t=1_epoch={epoch}.pth'
+                torch.save(model.state_dict(), model_save_path)
+                print(f"Model saved to {model_save_path}")
+                save_loss_plot(loss_list, loss_plot_name, epoch)
+                save_loss_plot(entropy_list, entropy_plot_name, epoch)
+                
             
-    save_loss_plot(loss_list, loss_plot_name)
-    save_loss_plot(entropy_list, entropy_plot_name)
+    

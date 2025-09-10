@@ -1,77 +1,98 @@
-import torch 
-# from config import T
-from dit import DiT
-import matplotlib.pyplot as plt 
-from diffusion import *
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import os
 from unet import UNet
-DEVICE='cuda' if torch.cuda.is_available() else 'cpu' # 设备
-T = 1000
-def backward_denoise(model,x,y):
-    steps=[x.clone(),]
+from diffusion import T, betas, alphas, alphas_cumprod, variance, extract
 
-    global alphas,alphas_cumprod,variance
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    x=x.to(DEVICE)
-    alphas=alphas.to(DEVICE)
-    alphas_cumprod=alphas_cumprod.to(DEVICE)
-    variance=variance.to(DEVICE)
-    y=y.to(DEVICE)
-    
-    model.eval()
-    with torch.no_grad():
-        for time in range(T-1,-1,-1):
-            t=torch.full((x.size(0),),time).to(DEVICE) 
+# ======================
+# 反向采样过程（给定类别）
+# ======================
+@torch.no_grad()
+def p_sample(model, z_t, t, y_class):
+    """
+    一个反向采样步：
+    z_{t-1} = 1/sqrt(alpha_t) * (z_t - beta_t/sqrt(1 - \bar{alpha}_t) * eps_pred) + sigma_t * noise
+    """
+    b_t = extract(betas, t, z_t.shape)
+    a_t = extract(alphas, t, z_t.shape)
+    a_bar_t = extract(alphas_cumprod, t, z_t.shape)
 
-            # 预测x_t时刻的噪音
-            noise=model(x,t,y)    
-            
-            # 生成t-1时刻的图像
-            shape=(x.size(0),1,1,1) 
-            mean=1/torch.sqrt(alphas[t].view(*shape))*  \
-                (
-                    x-
-                    (1-alphas[t].view(*shape))/torch.sqrt(1-alphas_cumprod[t].view(*shape))*noise
-                )
-            if time!=0:
-                x=mean+ \
-                    torch.randn_like(x)* \
-                    torch.sqrt(variance[t].view(*shape))
-            else:
-                x=mean
-            x=torch.clamp(x, -1.0, 1.0).detach()
-            steps.append(x)
-    return steps
+    eps_pred = model(z_t, t, y_class)
 
-if __name__ == '__main__':
-    # model = DiT(image_size=28, embed_dim=64, patch_size=4, depth=3, num_heads=4, num_classes=10, out_channels=1).to(DEVICE)
-    # model = DiT(img_size=28, patch_size=4, channel=1, emb_size=64, label_num=10, dit_num=3, head=4).to(DEVICE)
-    model = UNet(img_channels=1, base_ch=64, channel_mults=(1, 2, 4), time_emb_dim=128, num_classes=10).to(DEVICE)
-    model_path = 'model/unet_model.pth'
-    # model_path = 'model/transformer_model.pth'
-    model.load_state_dict(torch.load(model_path))
-    inference_plot_path = 'results/unet_denoise.png'
-    # inference_plot_path = 'results/transformer_denoise.png'
+    # 均值项
+    mu = (1.0 / torch.sqrt(a_t)) * (z_t - (b_t / torch.sqrt(1.0 - a_bar_t)) * eps_pred)
 
-    # 生成噪音图
-    batch_size=10
-    x=torch.randn(size=(batch_size,1,28,28))  # (5,1,24,24)
-    y=torch.arange(start=0,end=10,dtype=torch.long)   # 
-    # 逐步去噪得到原图
-    steps=backward_denoise(model,x,y)
-    # 绘制数量
-    num_imgs=20
-    # 绘制还原过程
-    plt.figure(figsize=(15,15))
-    for b in range(batch_size):
-        for i in range(0,num_imgs):
-            idx=int(T/num_imgs)*(i+1)
-            # 像素值还原到[0,1]
-            final_img=(steps[idx][b].to('cpu')+1)/2
-            # tensor转回PIL图
-            final_img=final_img.permute(1,2,0)
-            plt.subplot(batch_size,num_imgs,b*num_imgs+i+1)
-            plt.imshow(final_img)
+    if t[0] > 0:
+        var_t = extract(variance, t, z_t.shape)
+        noise = torch.randn_like(z_t)
+        z_prev = mu + torch.sqrt(var_t) * noise
+    else:
+        z_prev = mu
+    return z_prev
 
-    plt.savefig(inference_plot_path)
-    plt.show()
+@torch.no_grad()
+def sample(model, n_samples=16, given_class=None, K=10):
+    """
+    采样过程（和 Mixture of Diffusion 论文一致）
+    - given_class: 如果指定，则所有样本固定为该类
+    - 如果为 None，则从均匀分布先验中采样一次类别，并在整个反向扩散过程中保持不变
+    """
+    # 1. 初始噪声
+    z_t = torch.randn(n_samples, 1, 28, 28, device=DEVICE)
+
+    # 2. 类别采样
+    if given_class is None:
+        # 从 prior (均匀分布) 一次性采样类别
+        y_class = torch.randint(0, K, (n_samples,), device=DEVICE)
+    else:
+        # 固定为指定类别
+        y_class = torch.full((n_samples,), given_class, device=DEVICE)
+
+    # 3. 反向扩散
+    for t_step in reversed(range(T)):
+        t_tensor = torch.full((n_samples,), t_step, device=DEVICE, dtype=torch.long)
+        z_t = p_sample(model, z_t, t_tensor, y_class)
+
+    return z_t, y_class
+
+
+# ======================
+# 可视化函数
+# ======================
+def save_images(samples, path, nrow=4):
+    samples = (samples.clamp(-1,1) + 1) / 2.0  # [-1,1] -> [0,1]
+    samples = samples.cpu()
+    grid = torch.zeros(1, samples.size(2)*nrow, samples.size(3)*nrow)
+    idx = 0
+    for i in range(nrow):
+        for j in range(nrow):
+            grid[:, i*samples.size(2):(i+1)*samples.size(2), j*samples.size(3):(j+1)*samples.size(3)] = samples[idx]
+            idx += 1
+    plt.imshow(grid.squeeze(0), cmap="gray")
+    plt.axis("off")
+    plt.savefig(path, bbox_inches="tight")
     plt.close()
+
+# ======================
+# 主程序
+# ======================
+if __name__ == "__main__":
+    K = 10
+    model = UNet(img_channels=1, base_ch=64, channel_mults=(1,2,4), time_emb_dim=128, num_classes=K).to(DEVICE)
+    model.load_state_dict(torch.load("model/unet_best.pth", weights_only=False, map_location=DEVICE))
+    model.eval()
+    
+    sample_path = "samples/best"
+    os.makedirs(sample_path, exist_ok=True)
+
+    # 1. 不指定类别（从先验采样）
+    samples, y_class = sample(model, n_samples=16, given_class=None, K=K)
+    save_images(samples, f"{sample_path}/sample_random.png")
+
+    # 2. 指定每个类别采样（可检查每类学到了什么）
+    for cls in range(K):
+        samples, _ = sample(model, n_samples=16, given_class=cls, K=K)
+        save_images(samples, f"{sample_path}/sample_class_{cls}.png")

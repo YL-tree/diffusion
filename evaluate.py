@@ -9,7 +9,7 @@ from torchvision import transforms
 from torchvision.utils import save_image
 from torch.utils.data import DataLoader
 from torch_fidelity import calculate_metrics
-from inference_unsup import sample
+from inference import sample
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
