@@ -40,21 +40,19 @@ if __name__ == '__main__':
     model = UNet(img_channels=1, base_ch=64, channel_mults=(1, 2, 4),
                  time_emb_dim=128, num_classes=K).to(DEVICE)
     
-    model_path = 'model/unet.pth'
+    model_load_path = 'model/unet.pth'
     model_save_path = 'model/unet_t=1.pth'
     loss_plot_name = 'loss_t=1'
     entropy_plot_name = 'entropy_t=1'
     
     try:
-        model.load_state_dict(torch.load(model_path, weights_only=False))
+        model.load_state_dict(torch.load(model_load_path, weights_only=False))
     except FileNotFoundError:
         print("Model file not found, starting training from scratch.")
     except Exception as e:
         print(f"Error loading model: {e}, starting from scratch.")
 
     loss_fn = nn.MSELoss(reduction='none')  # 用 MSE，和 DDPM 一致
-    
-
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
     model.train()
@@ -118,16 +116,18 @@ if __name__ == '__main__':
                 entropy_list.append(entropy)
 
             if iter_count % 1000 == 0:
+                torch.save(model.state_dict(), model_save_path)
                 print(f"epoch {epoch}, iter {iter_count}, loss {loss.item():.4f}, posterior entropy {entropy:.3f}")
             iter_count += 1
 
-            # 每100epoch保存一次模型
-            if epoch % 100 == 0:
-                model_save_path = f'model/unet_t=1_epoch={epoch}.pth'
-                torch.save(model.state_dict(), model_save_path)
-                print(f"Model saved to {model_save_path}")
-                save_loss_plot(loss_list, loss_plot_name, epoch)
-                save_loss_plot(entropy_list, entropy_plot_name, epoch)
-                
+        # 每100epoch保存一次模型
+        if epoch % 100 == 0:
+            model_save_path_epoch = f'model/unet_t=1_epoch={epoch}.pth'
+            torch.save(model.state_dict(), model_save_path_epoch)
+            print(f"Model saved to {model_save_path_epoch}")
+            save_loss_plot(loss_list, loss_plot_name, epoch)
+            save_loss_plot(entropy_list, entropy_plot_name, epoch)
+
+        
             
     

@@ -15,7 +15,6 @@ betas = make_beta_schedule(T)  # (T,)
 alphas = 1.0 - betas
 alphas_cumprod = torch.cumprod(alphas, dim=-1)  # \bar{alpha}_t
 alphas_cumprod_prev = torch.cat((torch.tensor([1.0]), alphas_cumprod[:-1]), dim=-1)  # \bar{alpha}_{t-1}
-
 # 方差项，用在反向采样里（无监督时近似后验也要用）
 variance = (1 - alphas) * (1 - alphas_cumprod_prev) / (1 - alphas_cumprod)
 
