@@ -6,24 +6,37 @@ from torchvision import datasets, transforms
 from torchvision.utils import save_image
 import os
 import numpy as np
+import matplotlib.pyplot as plt
+
+def save_loss_plot(loss_list, plot_name, epoch):
+    plt.figure(figsize=(10, 6))
+    plt.plot(loss_list, label=f'Training {plot_name}')
+    plt.xlabel('Iterations')
+    plt.ylabel(f'{plot_name}')
+    plt.title(f'Training {plot_name} Over Time')
+    plt.legend()
+    plt.savefig(f'results/mixture_vae_3_{plot_name}.png')
+    plt.close()
 
 # =============================================================================
 # 1. 配置参数 (Configuration)
 # =============================================================================
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 BATCH_SIZE = 100
-EPOCHS = 20
-LEARNING_RATE = 1e-5
+EPOCHS = 100
+# --- MODIFIED: 调整了学习率到一个更常见的值 ---
+LEARNING_RATE = 1e-4
 LATENT_DIM = 64  # z 的维度
 NUM_CLASSES = 10  # x 的维度 (MNIST类别数)
 UNLABELED_RATIO = 0.98  # 98%的数据将作为无标签数据使用
 
 # 创建结果保存目录
-if not os.path.exists('results/mixture_vae_reconstruction'):
-    os.makedirs('results/mixture_vae_reconstruction')
-if not os.path.exists('results/mixture_vae_generated'):
-    os.makedirs('results/mixture_vae_generated')
-
+if not os.path.exists('results/mixture_vae_reconstruction_4'):
+    os.makedirs('results/mixture_vae_reconstruction_4')
+if not os.path.exists('results/mixture_vae_generated_4'):
+    os.makedirs('results/mixture_vae_generated_4')
+if not os.path.exists('model/VAE_4'):
+    os.makedirs('model/VAE_4')
 
 # =============================================================================
 # 2. 混合VAE 模型定义 (Mixture VAE Model Definition)
@@ -69,8 +82,11 @@ class MixtureVAE(nn.Module):
         return mu + eps * std
 
     def decode(self, z, x_onehot):
-        # 将 z 和 x 拼接
-        z_x_concat = torch.cat([z, x_onehot], dim=1)
+        # 增强 x_onehot 的信号
+        x_enhanced = x_onehot * 10.0 # 10.0 是一个可以调整的超参数
+        
+        # 将 z 和增强后的 x 拼接
+        z_x_concat = torch.cat([z, x_enhanced], dim=1)
         return self.decoder_net(z_x_concat)
 
     def forward(self, y):
@@ -83,40 +99,50 @@ class MixtureVAE(nn.Module):
 # =============================================================================
 # 3. 损失函数定义 (Loss Function)
 # =============================================================================
+# --- MODIFIED: 完全重写了损失函数以修正逻辑错误 ---
 def mvae_loss_function(y, probs_x, mu, log_var, z, model):
-    # 将 y 展平
+    """
+    计算混合VAE的损失函数 (-ELBO)。
+    -ELBO = E_{q(x|y)}[log p(y|x,z)] + E_{q(x|y)}[KL(q(z|y)||p(z))] + KL(q(x|y)||p(x))
+    在实践中，我们最小化：
+    重构损失的期望 + beta * KL散度(z) + alpha * KL散度(x)
+    """
     y_flat = y.view(-1, 784)
 
-    # --- E-Step in Loss (对x求期望) ---
-    # 对于每个可能的类别 k，计算其对应的重构损失和KL散度
-    # 然后用后验概率 p(x=k|y) 进行加权求和
-    loss = 0
+    # --- 第一部分: 重构损失的期望 E_{q(x|y)}[log p(y|x,z)] ---
+    # 通过对所有可能的类别k进行加权求和来计算期望
+    expected_recon_loss = 0
     for k in range(model.num_classes):
-        # 构造 one-hot 向量
+        # 为类别k创建one-hot向量
         x_k = torch.eye(model.num_classes, device=DEVICE)[k].expand(y.size(0), model.num_classes)
-
-        # 解码得到重构图像
+        
+        # 使用类别k的one-hot向量和z进行解码，得到重构图像
         y_reconstructed = model.decode(z, x_k)
-
-        # 1. 重构损失 (Reconstruction Loss)
+        
+        # 计算类别k下的重构损失 (负对数似然)
         recon_loss_k = F.binary_cross_entropy(y_reconstructed, y_flat, reduction='none').sum(dim=1)
+        
+        # 使用后验概率 p(x=k|y) (即 probs_x[:, k]) 进行加权
+        expected_recon_loss += probs_x[:, k] * recon_loss_k
 
-        # 2. KL散度损失 (KL Divergence for z)
-        # p(z) ~ N(0,I), q(z|y) ~ N(mu, sigma)
-        kld_z = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
+    # --- 第二部分: 连续潜变量z的KL散度 ---
+    # KL(q(z|y) || p(z)) where p(z) is N(0,I)
+    kld_z = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
 
-        # 3. KL散度损失 (KL Divergence for x)
-        # p(x) ~ Uniform, q(x|y) is the predicted prob
-        # KL(q(x|y) || p(x))
-        prior_x = torch.full_like(probs_x, 1.0 / model.num_classes)
-        kld_x = (probs_x * (torch.log(probs_x + 1e-10) - torch.log(prior_x + 1e-10))).sum(dim=1)
+    # --- 第三部分: 离散潜变量x的KL散度 ---
+    # KL(q(x|y) || p(x)) where p(x) is a uniform categorical distribution
+    prior_x = torch.full_like(probs_x, 1.0 / model.num_classes)
+    # 添加一个小的epsilon防止log(0)
+    kld_x = (probs_x * (torch.log(probs_x + 1e-10) - torch.log(prior_x + 1e-10))).sum(dim=1)
 
-        # 用后验概率 p(x=k|y) 对损失加权
-        # E_{q(x|y)}[log p(y|x,z) - KL(q(z|y)||p(z))]
-        # L = p(x=k|y) * (Recon_k + KLD_z) + KLD_x
-        loss += probs_x[:, k] * (recon_loss_k + 0.01*kld_z) + kld_x
+    # --- 组合所有部分形成最终的损失 (-ELBO) ---
+    # 我们加上KL散度，因为我们是在最小化(-ELBO)，而KL散度是正的
+    # 这里的 0.01 是一个超参数(beta)，用于平衡重构和正则化
+    alpha = 0.2
+    beta = 0.5
+    loss = expected_recon_loss + beta * kld_z + alpha * kld_x
 
-    return loss.mean()
+    return loss.mean(), expected_recon_loss.mean(), kld_z.mean(), kld_x.mean()
 
 
 # =============================================================================
@@ -142,22 +168,21 @@ train_loader = DataLoader(dataset=full_dataset, batch_size=BATCH_SIZE, shuffle=T
 if __name__ == '__main__':
     model = MixtureVAE().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    model_load_path = 'model/mixture_vae_mnist.pth'
+    model_load_path = 'model/VAE_4/mixture_vae_mnist.pth'
 
     try:
         model.load_state_dict(torch.load(model_load_path, weights_only=False))
+        print(f"成功从 {model_load_path} 加载模型。")
     except FileNotFoundError:
-        print("Model file not found, starting training from scratch.")
+        print("模型文件未找到，将从头开始训练。")
     except Exception as e:
-        print(f"Error loading model: {e}, starting from scratch.")
+        print(f"加载模型时出错: {e}，将从头开始训练。")
 
     print(f"开始在 {DEVICE} 上训练 Mixture VAE...")
     print(f"数据集中 {len(unlabeled_indices.indices)} 个样本将被视为无标签。")
-
-    # 创建一个mask来识别无标签数据
-    unlabeled_mask = torch.zeros(len(full_dataset), dtype=torch.bool)
-    unlabeled_mask[unlabeled_indices.indices] = True
-
+    
+    # 记录损失
+    loss_list = []
     for epoch in range(1, EPOCHS + 1):
         model.train()
         total_loss = 0
@@ -169,47 +194,78 @@ if __name__ == '__main__':
             probs_x, mu, log_var, z = model(y)
 
             # --- 这是EM算法的核心 ---
-            # 1. 对于有标签数据，我们使用真实标签
-            # 2. 对于无标签数据，我们使用模型推断的后验 p(x|y)
-            # 在这个统一的损失函数 mvae_loss_function 中，
-            # 这一步已经通过对所有k求期望隐式地完成了，相当于一个"软EM"
+            # 当前的损失函数是一个纯粹的无监督实现 ("软EM")
+            # 它对所有数据都使用模型推断的后验 p(x|y)
+            #
+            # (可选) 如果要实现半监督学习:
+            # 你需要一个mask来区分有标签和无标签的样本
+            # 1. 对无标签样本，使用当前的 mvae_loss_function
+            # 2. 对有标签样本，构造一个不同的损失：
+            #    - 重构损失: 只计算真实类别 x_true 对应的重构
+            #    - 分类损失: 添加一个交叉熵损失，鼓励 probs_x 接近 x_true 的 one-hot 编码
 
-            loss = mvae_loss_function(y, probs_x, mu, log_var, z, model)
+            loss, expected_recon_loss, kld_z, kld_x = mvae_loss_function(y, probs_x, mu, log_var, z, model)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
+            if batch_idx % 100 == 0:
+                loss_list.append(loss.item())
 
         avg_loss = total_loss / len(train_loader)
-        print(f'====> Epoch: {epoch} 平均损失: {avg_loss:.4f}')
+        print(f'====> Epoch: {epoch} 平均损失: {avg_loss:.4f} 重构损失: {expected_recon_loss:.4f} KL(z): {kld_z:.4f} KL(x): {kld_x:.4f} ')       
 
         # --- 可视化 ---
-        if epoch % 5 == 0:
+        if epoch % 10 == 1 or epoch == EPOCHS:
             model.eval()
             with torch.no_grad():
-                # 在训练循环中保存生成结果
-                num_per_class = 20  # 每个类别生成多少张图
+                # 可视化重构结果
+                # 从测试集中取一些样本
+                test_dataset = datasets.MNIST(root='./', train=False, transform=transform, download=True)
+                test_loader = DataLoader(test_dataset, batch_size=10, shuffle=True)
+                test_iter = iter(test_loader)
+                y_test, x_true_test = next(test_iter)  # Get test labels
+                y_test = y_test.to(DEVICE)
+                x_true_test = x_true_test.to(DEVICE)
+
+                # 编码并找到概率最高的类别
+                probs_x_test, _, _, z_test = model(y_test)
+                x_pred = torch.argmax(probs_x_test, dim=1)
+                x_onehot_pred = F.one_hot(x_pred, num_classes=NUM_CLASSES).float()
+                
+
+                # 使用预测的类别进行解码重构
+                y_reconstructed_test = model.decode(z_test, x_onehot_pred)
+
+                # 保存对比图像
+                comparison = torch.cat([y_test.view(-1, 1, 28, 28), 
+                                        y_reconstructed_test.view(-1, 1, 28, 28)])
+                save_image(comparison.cpu(),
+                           f'results/mixture_vae_reconstruction_4/reconstruction_epoch_{epoch}.png', nrow=y_test.size(0))
+
+
+                # 可视化按类别生成的结果
+                num_per_class = 10  # 每个类别生成多少张图
                 all_generated = []
 
                 for k in range(NUM_CLASSES):
-                    # 生成该簇的多个样本
                     z_sample = torch.randn(num_per_class, LATENT_DIM).to(DEVICE)
                     x_sample = torch.eye(NUM_CLASSES)[k].unsqueeze(0).repeat(num_per_class, 1).to(DEVICE)
-
                     generated = model.decode(z_sample, x_sample).cpu()
                     all_generated.append(generated)
 
-                # 拼接所有类别的生成结果
                 all_generated = torch.cat(all_generated, dim=0)
-
                 save_image(
                     all_generated.view(NUM_CLASSES * num_per_class, 1, 28, 28),
-                    f'results/mixture_vae_generated/generated_clusters_{epoch}.png',
-                    nrow=num_per_class  # 每行 num_per_class 张，同一类在一行
+                    f'results/mixture_vae_generated_4/generated_clusters_epoch_{epoch}.png',
+                    nrow=num_per_class
                 )
+                torch.save(model.state_dict(), f"model/VAE_4/mixture_vae_mnist_{epoch}.pth")
+                # 绘制损失图
+                save_loss_plot(loss_list, 'loss', epoch)
 
-        # 训练完成后保存模型
-        torch.save(model.state_dict(), 'model/mixture_vae_mnist.pth')
-        print("训练完成，模型已保存。")
+    # 训练完成后保存模型
+    torch.save(model.state_dict(), model_load_path)
+    print(f"训练完成，模型已保存至 {model_load_path}。")
