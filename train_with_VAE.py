@@ -1,271 +1,272 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import torch.optim as optim
 from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, TensorDataset
 from torchvision.utils import save_image
 import os
+from tqdm import tqdm
 import numpy as np
-import matplotlib.pyplot as plt
 
-def save_loss_plot(loss_list, plot_name, epoch):
-    plt.figure(figsize=(10, 6))
-    plt.plot(loss_list, label=f'Training {plot_name}')
-    plt.xlabel('Iterations')
-    plt.ylabel(f'{plot_name}')
-    plt.title(f'Training {plot_name} Over Time')
-    plt.legend()
-    plt.savefig(f'results/mixture_vae_3_{plot_name}.png')
-    plt.close()
+# --- 1. 参数设置 ---
+# EM 训练参数
+NUM_EM_EPOCHS = 10    # EM算法迭代次数
+NUM_M_STEP_EPOCHS = 3 # 每次M-step中，模型训练的轮数
 
-# =============================================================================
-# 1. 配置参数 (Configuration)
-# =============================================================================
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-BATCH_SIZE = 100
-EPOCHS = 100
-# --- MODIFIED: 调整了学习率到一个更常见的值 ---
-LEARNING_RATE = 1e-4
-LATENT_DIM = 64  # z 的维度
-NUM_CLASSES = 10  # x 的维度 (MNIST类别数)
-UNLABELED_RATIO = 0.98  # 98%的数据将作为无标签数据使用
+# 模型参数
+LATENT_DIM = 20       # 潜变量z的维度
+NUM_CLASSES = 10      # 类别数量 (MNIST有10类)
 
-# 创建结果保存目录
-if not os.path.exists('results/mixture_vae_reconstruction_4'):
-    os.makedirs('results/mixture_vae_reconstruction_4')
-if not os.path.exists('results/mixture_vae_generated_4'):
-    os.makedirs('results/mixture_vae_generated_4')
-if not os.path.exists('model/VAE_4'):
-    os.makedirs('model/VAE_4')
+# 数据和训练参数
+BATCH_SIZE = 128
+LEARNING_RATE = 1e-3
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# =============================================================================
-# 2. 混合VAE 模型定义 (Mixture VAE Model Definition)
-# =============================================================================
-class MixtureVAE(nn.Module):
-    def __init__(self, latent_dim=LATENT_DIM, num_classes=NUM_CLASSES):
-        super(MixtureVAE, self).__init__()
+# 创建输出目录
+if not os.path.exists('results_em_cvae'):
+    os.makedirs('results_em_cvae')
+
+# --- 2. 数据加载 ---
+train_loader = DataLoader(
+    datasets.MNIST('./', train=True, download=True,
+                   transform=transforms.ToTensor()),
+    batch_size=BATCH_SIZE, shuffle=True)
+
+# 为了评估，我们也加载测试集
+test_loader = DataLoader(
+    datasets.MNIST('./', train=False,
+                   transform=transforms.ToTensor()),
+    batch_size=BATCH_SIZE, shuffle=False)
+
+# --- 3. CVAE 模型定义 ---
+
+class ConditionalVAE(nn.Module):
+    def __init__(self, latent_dim, num_classes):
+        super(ConditionalVAE, self).__init__()
         self.latent_dim = latent_dim
         self.num_classes = num_classes
 
-        # --- 编码器 (Inference Network) ---
-        # 目标: 从 y 推断 p(x|y) 和 q(z|y)
+        image_size = 28 * 28
+        # --- 编码器 ---
+        # 输入: image + one-hot label
         self.encoder_net = nn.Sequential(
-            nn.Linear(784, 512), nn.ReLU(),
+            nn.Linear(image_size + num_classes, 512), nn.ReLU(),
             nn.Linear(512, 256), nn.ReLU()
         )
-        # 输出离散变量 x 的 logits
-        self.fc_logits_x = nn.Linear(256, num_classes)
-        # 输出连续变量 z 的分布参数
-        self.fc_mu = nn.Linear(256, latent_dim)
-        self.fc_log_var = nn.Linear(256, latent_dim)
+        self.encoder_fc_mu = nn.Linear(256, latent_dim)
+        self.encoder_fc_logvar = nn.Linear(256, latent_dim)
 
-        # --- 解码器 (Generative Network) ---
-        # 目标: 从 x 和 z 生成 p(y|x, z)
-        # 我们将 x (one-hot) 和 z 拼接起来作为输入
+        # --- 解码器 ---
+        # 输入: latent z + one-hot label
         self.decoder_net = nn.Sequential(
             nn.Linear(latent_dim + num_classes, 256), nn.ReLU(),
             nn.Linear(256, 512), nn.ReLU(),
             nn.Linear(512, 784), nn.Sigmoid()
         )
 
-    def encode(self, y_flat):
-        h = self.encoder_net(y_flat)
-        logits_x = self.fc_logits_x(h)
-        probs_x = F.softmax(logits_x, dim=1)  # p(x|y)
-        mu = self.fc_mu(h)
-        log_var = self.fc_log_var(h)
-        return probs_x, mu, log_var
+    def encode(self, y, x_onehot):
+        # 将图像和标签拼接
+        inputs = torch.cat([y.view(-1, 28*28), x_onehot], dim=1)
+        h1 = self.encoder_net(inputs)
+        return self.encoder_fc_mu(h1), self.encoder_fc_logvar(h1)
 
-    def reparameterize(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
     def decode(self, z, x_onehot):
-        # 增强 x_onehot 的信号
-        x_enhanced = x_onehot * 10.0 # 10.0 是一个可以调整的超参数
-        
-        # 将 z 和增强后的 x 拼接
-        z_x_concat = torch.cat([z, x_enhanced], dim=1)
-        return self.decoder_net(z_x_concat)
+        # 将潜变量和标签拼接
+        inputs = torch.cat([z, x_onehot], dim=1)
+        return self.decoder_net(inputs)
 
-    def forward(self, y):
-        y_flat = y.view(-1, 784)
-        probs_x, mu, log_var = self.encode(y_flat)
-        z = self.reparameterize(mu, log_var)
-        return probs_x, mu, log_var, z
+    def forward(self, y, x_onehot):
+        mu, logvar = self.encode(y, x_onehot)
+        z = self.reparameterize(mu, logvar)
+        recon_y = self.decode(z, x_onehot)
+        return recon_y, mu, logvar
 
+# 损失函数: Negative ELBO
+def loss_function(recon_y, y, mu, logvar):
+    BCE = F.binary_cross_entropy(recon_y, y.view(-1, 784), reduction='sum')
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return BCE + KLD
 
-# =============================================================================
-# 3. 损失函数定义 (Loss Function)
-# =============================================================================
-# --- MODIFIED: 完全重写了损失函数以修正逻辑错误 ---
-def mvae_loss_function(y, probs_x, mu, log_var, z, model):
+# --- 4. EM 算法实现 ---
+def e_step(model, dataloader, label_priors, num_classes, device):
     """
-    计算混合VAE的损失函数 (-ELBO)。
-    -ELBO = E_{q(x|y)}[log p(y|x,z)] + E_{q(x|y)}[KL(q(z|y)||p(z))] + KL(q(x|y)||p(x))
-    在实践中，我们最小化：
-    重构损失的期望 + beta * KL散度(z) + alpha * KL散度(x)
+    E-Step: 计算后验概率 p(x|y) (即 gamma)
     """
-    y_flat = y.view(-1, 784)
+    model.eval()
+    all_gamma = []
+    all_true_labels = []
 
-    # --- 第一部分: 重构损失的期望 E_{q(x|y)}[log p(y|x,z)] ---
-    # 通过对所有可能的类别k进行加权求和来计算期望
-    expected_recon_loss = 0
-    for k in range(model.num_classes):
-        # 为类别k创建one-hot向量
-        x_k = torch.eye(model.num_classes, device=DEVICE)[k].expand(y.size(0), model.num_classes)
-        
-        # 使用类别k的one-hot向量和z进行解码，得到重构图像
-        y_reconstructed = model.decode(z, x_k)
-        
-        # 计算类别k下的重构损失 (负对数似然)
-        recon_loss_k = F.binary_cross_entropy(y_reconstructed, y_flat, reduction='none').sum(dim=1)
-        
-        # 使用后验概率 p(x=k|y) (即 probs_x[:, k]) 进行加权
-        expected_recon_loss += probs_x[:, k] * recon_loss_k
+    print("Performing E-Step...")
+    with torch.no_grad():
+        for y_batch, true_labels in tqdm(dataloader):
+            y_batch = y_batch.to(device)
+            batch_size = y_batch.size(0)
 
-    # --- 第二部分: 连续潜变量z的KL散度 ---
-    # KL(q(z|y) || p(z)) where p(z) is N(0,I)
-    kld_z = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
+            # 准备输入，为每个可能的类别计算ELBO
+            # y_batch: [B, 1, 28, 28] -> [B, K, 1, 28, 28] -> [B*K, 1, 28, 28]
+            y_tiled = y_batch.unsqueeze(1).repeat(1, num_classes, 1, 1, 1).view(-1, 1, 28, 28)
 
-    # --- 第三部分: 离散潜变量x的KL散度 ---
-    # KL(q(x|y) || p(x)) where p(x) is a uniform categorical distribution
-    prior_x = torch.full_like(probs_x, 1.0 / model.num_classes)
-    # 添加一个小的epsilon防止log(0)
-    kld_x = (probs_x * (torch.log(probs_x + 1e-10) - torch.log(prior_x + 1e-10))).sum(dim=1)
+            # x_onehot: [K, K] -> [B, K, K] -> [B*K, K]
+            x_onehot = torch.eye(num_classes, device=device)
+            x_onehot_tiled = x_onehot.unsqueeze(0).repeat(batch_size, 1, 1).view(-1, num_classes)
 
-    # --- 组合所有部分形成最终的损失 (-ELBO) ---
-    # 我们加上KL散度，因为我们是在最小化(-ELBO)，而KL散度是正的
-    # 这里的 0.01 是一个超参数(beta)，用于平衡重构和正则化
-    alpha = 0.2
-    beta = 0.5
-    loss = expected_recon_loss + beta * kld_z + alpha * kld_x
+            # 通过模型计算重构和潜变量分布
+            recon_flat, mu_flat, logvar_flat = model(y_tiled, x_onehot_tiled)
+            
+            # 计算负ELBO
+            neg_elbo_flat = loss_function(recon_flat, y_tiled, mu_flat, logvar_flat)
+            neg_elbo_batched = neg_elbo_flat.view(batch_size, num_classes)
+            
+            # ELBO = -neg_elbo
+            elbo = -neg_elbo_batched
 
-    return loss.mean(), expected_recon_loss.mean(), kld_z.mean(), kld_x.mean()
+            # 计算 log p(y,x) = log p(y|x) + log p(x)
+            # 我们用 ELBO(y,x) 来近似 log p(y|x)
+            log_p_y_x = elbo + torch.log(label_priors).unsqueeze(0)
+
+            # 使用 log-sum-exp 技巧计算 log p(y) 以保证数值稳定性
+            log_p_y = torch.logsumexp(log_p_y_x, dim=1, keepdim=True)
+            
+            # 计算 log p(x|y) = log p(y,x) - log p(y)
+            log_gamma = log_p_y_x - log_p_y
+            
+            gamma_batch = torch.exp(log_gamma)
+            
+            all_gamma.append(gamma_batch.cpu())
+            all_true_labels.append(true_labels)
+
+    return torch.cat(all_gamma, dim=0), torch.cat(all_true_labels, dim=0)
 
 
-# =============================================================================
-# 4. 数据加载 (Data Loading)
-# =============================================================================
-transform = transforms.ToTensor()
-full_dataset = datasets.MNIST(root='./', train=True, transform=transform, download=True)
-
-# 划分有标签和无标签数据集
-n_samples = len(full_dataset)
-n_labeled = int(n_samples * (1 - UNLABELED_RATIO))
-n_unlabeled = n_samples - n_labeled
-labeled_indices, unlabeled_indices = torch.utils.data.random_split(
-    range(n_samples), [n_labeled, n_unlabeled]
-)
-# 这里我们为了简化，仍然使用所有数据的标签，但在损失函数中会忽略无标签数据的标签
-# 一个更严格的实现会创建一个新的Dataset类
-train_loader = DataLoader(dataset=full_dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-# =============================================================================
-# 5. 训练主程序 (Training)
-# =============================================================================
-if __name__ == '__main__':
-    model = MixtureVAE().to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    model_load_path = 'model/VAE_4/mixture_vae_mnist.pth'
-
-    try:
-        model.load_state_dict(torch.load(model_load_path, weights_only=False))
-        print(f"成功从 {model_load_path} 加载模型。")
-    except FileNotFoundError:
-        print("模型文件未找到，将从头开始训练。")
-    except Exception as e:
-        print(f"加载模型时出错: {e}，将从头开始训练。")
-
-    print(f"开始在 {DEVICE} 上训练 Mixture VAE...")
-    print(f"数据集中 {len(unlabeled_indices.indices)} 个样本将被视为无标签。")
+def m_step(model, optimizer, dataloader, gamma):
+    """
+    M-Step: 更新模型参数和类别先验
+    """
+    model.train()
+    total_loss = 0
     
-    # 记录损失
-    loss_list = []
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        total_loss = 0
+    # 创建一个新的 DataLoader，包含数据和对应的 gamma
+    dataset_with_gamma = TensorDataset(dataloader.dataset.tensors[0], gamma)
+    loader_with_gamma = DataLoader(dataset_with_gamma, batch_size=BATCH_SIZE, shuffle=True)
 
-        for batch_idx, (y, x_true) in enumerate(train_loader):
-            y, x_true = y.to(DEVICE), x_true.to(DEVICE)
-
-            # 前向传播
-            probs_x, mu, log_var, z = model(y)
-
-            # --- 这是EM算法的核心 ---
-            # 当前的损失函数是一个纯粹的无监督实现 ("软EM")
-            # 它对所有数据都使用模型推断的后验 p(x|y)
-            #
-            # (可选) 如果要实现半监督学习:
-            # 你需要一个mask来区分有标签和无标签的样本
-            # 1. 对无标签样本，使用当前的 mvae_loss_function
-            # 2. 对有标签样本，构造一个不同的损失：
-            #    - 重构损失: 只计算真实类别 x_true 对应的重构
-            #    - 分类损失: 添加一个交叉熵损失，鼓励 probs_x 接近 x_true 的 one-hot 编码
-
-            loss, expected_recon_loss, kld_z, kld_x = mvae_loss_function(y, probs_x, mu, log_var, z, model)
-
+    print("Performing M-Step...")
+    for _ in range(NUM_M_STEP_EPOCHS):
+        epoch_loss = 0
+        for y_batch, gamma_batch in tqdm(loader_with_gamma):
+            y_batch, gamma_batch = y_batch.to(DEVICE), gamma_batch.to(DEVICE)
             optimizer.zero_grad()
-            loss.backward()
+            
+            # 同样地，准备输入以计算所有类别的损失
+            y_tiled = y_batch.unsqueeze(1).repeat(1, NUM_CLASSES, 1, 1, 1).view(-1, 1, 28, 28)
+            x_onehot = torch.eye(NUM_CLASSES, device=DEVICE)
+            x_onehot_tiled = x_onehot.unsqueeze(0).repeat(y_batch.size(0), 1, 1).view(-1, NUM_CLASSES)
+            
+            recon_flat, mu_flat, logvar_flat = model(y_tiled, x_onehot_tiled)
+
+            # 计算负ELBO (即损失)
+            neg_elbo_flat = loss_function(recon_flat, y_tiled, mu_flat, logvar_flat)
+            neg_elbo_batched = neg_elbo_flat.view(y_batch.size(0), NUM_CLASSES)
+
+            # 计算加权损失
+            weighted_loss = torch.sum(gamma_batch * neg_elbo_batched)
+            
+            weighted_loss.backward()
             optimizer.step()
+            epoch_loss += weighted_loss.item()
+            
+        print(f"  M-Step Epoch Loss: {epoch_loss / len(dataloader.dataset):.4f}")
 
-            total_loss += loss.item()
-            if batch_idx % 100 == 0:
-                loss_list.append(loss.item())
+    # 更新类别先验 p(x)
+    new_label_priors = torch.mean(gamma, dim=0)
+    
+    return new_label_priors
 
-        avg_loss = total_loss / len(train_loader)
-        print(f'====> Epoch: {epoch} 平均损失: {avg_loss:.4f} 重构损失: {expected_recon_loss:.4f} KL(z): {kld_z:.4f} KL(x): {kld_x:.4f} ')       
+# --- 5. 训练主循环 ---
 
-        # --- 可视化 ---
-        if epoch % 10 == 1 or epoch == EPOCHS:
-            model.eval()
-            with torch.no_grad():
-                # 可视化重构结果
-                # 从测试集中取一些样本
-                test_dataset = datasets.MNIST(root='./', train=False, transform=transform, download=True)
-                test_loader = DataLoader(test_dataset, batch_size=10, shuffle=True)
-                test_iter = iter(test_loader)
-                y_test, x_true_test = next(test_iter)  # Get test labels
-                y_test = y_test.to(DEVICE)
-                x_true_test = x_true_test.to(DEVICE)
+model = ConditionalVAE(latent_dim=LATENT_DIM, num_classes=NUM_CLASSES).to(DEVICE)
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-                # 编码并找到概率最高的类别
-                probs_x_test, _, _, z_test = model(y_test)
-                x_pred = torch.argmax(probs_x_test, dim=1)
-                x_onehot_pred = F.one_hot(x_pred, num_classes=NUM_CLASSES).float()
-                
+# 初始化类别先验为均匀分布
+label_priors = torch.ones(NUM_CLASSES, device=DEVICE) / NUM_CLASSES
 
-                # 使用预测的类别进行解码重构
-                y_reconstructed_test = model.decode(z_test, x_onehot_pred)
+# 加载整个训练集用于E-step
+full_train_loader = DataLoader(
+    datasets.MNIST('./', train=True, download=True,
+                   transform=transforms.ToTensor()),
+    batch_size=BATCH_SIZE, shuffle=False)
+full_train_dataset_tensors = next(iter(DataLoader(full_train_loader.dataset, batch_size=len(full_train_loader.dataset))))
 
-                # 保存对比图像
-                comparison = torch.cat([y_test.view(-1, 1, 28, 28), 
-                                        y_reconstructed_test.view(-1, 1, 28, 28)])
-                save_image(comparison.cpu(),
-                           f'results/mixture_vae_reconstruction_4/reconstruction_epoch_{epoch}.png', nrow=y_test.size(0))
+for em_epoch in range(NUM_EM_EPOCHS):
+    print(f"\n--- EM Epoch {em_epoch + 1}/{NUM_EM_EPOCHS} ---")
+    
+    # E-Step
+    gamma, _ = e_step(model, full_train_loader, label_priors, NUM_CLASSES, DEVICE)
+    
+    # M-Step
+    # 注意这里我们将整个训练数据和计算好的gamma传入
+    new_label_priors = m_step(model, optimizer, TensorDataset(full_train_dataset_tensors[0], full_train_dataset_tensors[1]), gamma)
+    
+    # 打印先验概率的变化
+    print(f"Old priors: {[f'{p:.3f}' for p in label_priors.cpu().numpy()]}")
+    print(f"New priors: {[f'{p:.3f}' for p in new_label_priors.cpu().numpy()]}")
+    label_priors = new_label_priors.to(DEVICE)
 
+print("\n--- Training Finished ---")
 
-                # 可视化按类别生成的结果
-                num_per_class = 10  # 每个类别生成多少张图
-                all_generated = []
+# --- 6. 结果评估 ---
 
-                for k in range(NUM_CLASSES):
-                    z_sample = torch.randn(num_per_class, LATENT_DIM).to(DEVICE)
-                    x_sample = torch.eye(NUM_CLASSES)[k].unsqueeze(0).repeat(num_per_class, 1).to(DEVICE)
-                    generated = model.decode(z_sample, x_sample).cpu()
-                    all_generated.append(generated)
+# (1) 评估聚类准确度
+print("\nEvaluating clustering accuracy...")
+# 使用 E-Step 函数来获取测试集的 gamma 分布
+test_gamma, test_true_labels = e_step(model, test_loader, label_priors, NUM_CLASSES, DEVICE)
+predicted_clusters = torch.argmax(test_gamma, dim=1).cpu().numpy()
+test_true_labels = test_true_labels.numpy()
 
-                all_generated = torch.cat(all_generated, dim=0)
-                save_image(
-                    all_generated.view(NUM_CLASSES * num_per_class, 1, 28, 28),
-                    f'results/mixture_vae_generated_4/generated_clusters_epoch_{epoch}.png',
-                    nrow=num_per_class
-                )
-                torch.save(model.state_dict(), f"model/VAE_4/mixture_vae_mnist_{epoch}.pth")
-                # 绘制损失图
-                save_loss_plot(loss_list, 'loss', epoch)
+# 建立聚类索引到真实标签的映射
+from scipy.stats import mode
+mapping = {}
+for i in range(NUM_CLASSES):
+    # 找到所有被预测为聚类 i 的真实标签
+    true_labels_for_cluster_i = test_true_labels[predicted_clusters == i]
+    if len(true_labels_for_cluster_i) > 0:
+        # 将这个聚类映射到最常见的真实标签
+        most_common_label = mode(true_labels_for_cluster_i, keepdims=False)[0]
+        mapping[i] = most_common_label
 
-    # 训练完成后保存模型
-    torch.save(model.state_dict(), model_load_path)
-    print(f"训练完成，模型已保存至 {model_load_path}。")
+# 计算准确率
+correct_predictions = 0
+for i in range(len(predicted_clusters)):
+    if predicted_clusters[i] in mapping:
+        if mapping[predicted_clusters[i]] == test_true_labels[i]:
+            correct_predictions += 1
+
+accuracy = correct_predictions / len(predicted_clusters)
+print(f"Clustering Accuracy on Test Set: {accuracy * 100:.2f}%")
+print("Cluster to Label Mapping:", mapping)
+
+# (2) 条件生成图像
+print("\nGenerating images conditioned on inferred labels...")
+with torch.no_grad():
+    # 为每个类别生成 10 张图像
+    num_gens_per_class = 10
+    # 从标准正态分布中采样 z
+    z_samples = torch.randn(num_gens_per_class * NUM_CLASSES, LATENT_DIM).to(DEVICE)
+    
+    # 创建要生成的标签
+    gen_labels = torch.arange(NUM_CLASSES).repeat(num_gens_per_class)
+    gen_x_onehot = F.one_hot(gen_labels, NUM_CLASSES).to(DEVICE).float()
+    
+    generated_images = model.decode(z_samples, gen_x_onehot).cpu()
+    
+    # 将生成的图像保存为网格图
+    save_image(generated_images.view(-1, 1, 28, 28),
+               'results_em_cvae/generated_samples.png',
+               nrow=num_gens_per_class)
+
+print("Generated images saved to 'results_em_cvae/generated_samples.png'")
