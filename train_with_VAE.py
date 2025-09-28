@@ -15,19 +15,19 @@ from torch.utils.data import random_split
 
 # --- 1. 参数设置 ---
 # EM 训练参数
-NUM_EM_EPOCHS = 100   # EM算法迭代次数
-NUM_M_STEP_EPOCHS = 3 # 每次M-step中，模型训练的轮数
+NUM_EM_EPOCHS = 50   # EM算法迭代次数
+NUM_M_STEP_EPOCHS = 1 # 每次M-step中，模型训练的轮数
 
 # 模型参数
-LATENT_DIM = 36       # 潜变量z的维度
+LATENT_DIM = 18       # 潜变量z的维度
 NUM_CLASSES = 10      # 类别数量 (MNIST有10类)
 
 # 数据和训练参数
-BATCH_SIZE = 128
-LEARNING_RATE = 1e-4
+BATCH_SIZE = 100
+LEARNING_RATE = 3e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-VALIDATION_INTERVAL = 10 
-SAVE_PATH = 'results_em_cvae'
+VALIDATION_INTERVAL = 2 
+SAVE_PATH = 'results_em_cvae_test'
 
 # 创建输出目录
 if not os.path.exists(SAVE_PATH):
@@ -36,6 +36,9 @@ if not os.path.exists(os.path.join(SAVE_PATH, 'loss')):
     os.makedirs(os.path.join(SAVE_PATH, 'loss'))
 if not os.path.exists(os.path.join(SAVE_PATH, 'model')):
     os.makedirs(os.path.join(SAVE_PATH, 'model'))
+if not os.path.exists(os.path.join(SAVE_PATH, 'samples')):
+    os.makedirs(os.path.join(SAVE_PATH, 'samples'))
+
 
 # --- 2. 数据加载 ---
 full_train_loader = DataLoader(
@@ -43,6 +46,10 @@ full_train_loader = DataLoader(
                    transform=transforms.ToTensor()),
     batch_size=BATCH_SIZE, shuffle=False)
 full_train_dataset_tensors = next(iter(DataLoader(full_train_loader.dataset, batch_size=len(full_train_loader.dataset))))
+
+# 获取完整的训练数据集
+train_images, train_labels = full_train_dataset_tensors
+train_images = train_images.to(DEVICE)
 
 # 将测试集划分为验证集和测试集
 data_loader = DataLoader(
@@ -70,22 +77,22 @@ class ConditionalVAE_CNN(nn.Module):
 
         # --- 编码器 ---
         self.encoder_conv = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1), # -> (N, 16, 14, 14)
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1), # -> (N, 16, 14, 14)
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), # -> (N, 32, 7, 7)
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), # -> (N, 32, 7, 7)
             nn.ReLU(),
         )
-        self.encoder_fc = nn.Linear(32 * 7 * 7 + num_classes, 256)
+        self.encoder_fc = nn.Linear(64 * 7 * 7 + num_classes, 256)
         self.fc_mu = nn.Linear(256, latent_dim)
         self.fc_logvar = nn.Linear(256, latent_dim)
 
         # --- 解码器 ---
         self.decoder_fc1 = nn.Linear(latent_dim + num_classes, 256)
-        self.decoder_fc2 = nn.Linear(256, 32 * 7 * 7)
+        self.decoder_fc2 = nn.Linear(256, 64 * 7 * 7)
         self.decoder_deconv = nn.Sequential(
-            nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2), # -> (N, 16, 14, 14)
+            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2), # -> (N, 16, 14, 14)
             nn.ReLU(),
-            nn.ConvTranspose2d(16, 1, kernel_size=2, stride=2), # -> (N, 1, 28, 28)
+            nn.ConvTranspose2d(32, 1, kernel_size=2, stride=2), # -> (N, 1, 28, 28)
             nn.Sigmoid()
         )
 
@@ -105,7 +112,7 @@ class ConditionalVAE_CNN(nn.Module):
         inputs = torch.cat([z, x_onehot], dim=1)
         h_fc1 = F.relu(self.decoder_fc1(inputs))
         h_fc2 = F.relu(self.decoder_fc2(h_fc1))
-        h_deconv_input = h_fc2.view(h_fc2.size(0), 32, 7, 7)
+        h_deconv_input = h_fc2.view(h_fc2.size(0), 64, 7, 7)
         return self.decoder_deconv(h_deconv_input)
 
     def forward(self, y, x_onehot):
@@ -168,14 +175,22 @@ def e_step(model, dataloader, label_priors, num_classes, device):
             # 对数似然 log p(y|x) 就用 -recon_loss 来近似
             log_likelihood = -recon_loss_batched
             # =============================================================
-
+            
             # 计算 log p(y,x) = log p(y|x) + log p(x)
             # 我们用近似的 log_likelihood 来代表 log p(y|x)
             log_p_y_x = log_likelihood + torch.log(label_priors).unsqueeze(0)
 
-            # 使用 log-sum-exp 技巧计算 log p(y) 以保证数值稳定性
-            log_p_y = torch.logsumexp(log_p_y_x, dim=1, keepdim=True)
             
+
+            # # 使用温度参数进行锐化
+            # temperature = 0.5 # 超参数，可以从接近1开始慢慢减小，例如0.9, 0.8...
+            # log_p_y_x_sharpened = log_p_y_x / temperature
+            # # 使用 log-sum-exp 技巧 计算 log p(y) 以保证数值稳定性
+            # log_p_y = torch.logsumexp(log_p_y_x_sharpened, dim=1, keepdim=True)
+            # log_gamma = log_p_y_x_sharpened - log_p_y
+
+            # 使用 log-sum-exp 技巧
+            log_p_y = torch.logsumexp(log_p_y_x, dim=1, keepdim=True)
             # 计算 log p(x|y) = log p(y,x) - log p(y)
             log_gamma = log_p_y_x - log_p_y
             gamma_batch = torch.exp(log_gamma)
@@ -184,7 +199,7 @@ def e_step(model, dataloader, label_priors, num_classes, device):
 
     return torch.cat(all_gamma, dim=0), torch.cat(all_true_labels, dim=0)
 
-def m_step(model, optimizer, dataloader, gamma):
+def m_step(model, optimizer, dataloader, gamma, beta=1.0):
     """
     M-Step: 更新模型参数和类别先验
     """
@@ -206,8 +221,14 @@ def m_step(model, optimizer, dataloader, gamma):
             
             recon_flat, mu_flat, logvar_flat = model(y_tiled, x_onehot_tiled)
 
+            # 分别计算重构损失和KL散度
+            recon_loss_part = F.binary_cross_entropy(recon_flat, y_tiled, reduction='none').sum(dim=[1, 2, 3])
+            kld_part = -0.5 * torch.sum(1 + logvar_flat - mu_flat.pow(2) - logvar_flat.exp(), dim=1)
+
+            # 使用 beta 加权 KL 散度
+            neg_elbo_flat = recon_loss_part + beta * kld_part
             # 计算负ELBO (即损失)
-            neg_elbo_flat = loss_function(recon_flat, y_tiled, mu_flat, logvar_flat)
+            # neg_elbo_flat = loss_function(recon_flat, y_tiled, mu_flat, logvar_flat)
             neg_elbo_batched = neg_elbo_flat.view(y_batch.size(0), NUM_CLASSES)
 
             # 计算加权损失
@@ -223,6 +244,149 @@ def m_step(model, optimizer, dataloader, gamma):
     new_label_priors = torch.mean(gamma, dim=0)
     
     return new_label_priors, epoch_loss / len(dataloader)
+
+def m_step_sampled(model, optimizer, dataloader, gamma, beta=1.0):
+    """
+    M-Step (Sampled EM): 从 gamma 分布中采样类别作为伪标签，
+    并统计类别计数来更新先验。
+    """
+    model.train()
+
+    # 统计每个类别的计数
+    class_counts = torch.zeros(NUM_CLASSES, device=DEVICE)
+
+    # === 先采样标签 ===
+    sampled_labels = torch.multinomial(gamma, num_samples=1).squeeze(1).to(DEVICE)   # (N,)
+    # 直接做 bincount 来统计类别分布
+    class_counts += torch.bincount(sampled_labels, minlength=NUM_CLASSES).float()
+    new_label_priors = class_counts / class_counts.sum()  # 归一化
+
+    # === 构建伪标签 one-hot ===
+    sampled_onehot = F.one_hot(sampled_labels, NUM_CLASSES).float()
+    dataset_with_labels = TensorDataset(dataloader.tensors[0], sampled_onehot)
+    loader_with_labels = DataLoader(dataset_with_labels, batch_size=BATCH_SIZE, shuffle=True)
+
+    print("Performing Sampled M-Step...")
+    total_loss = 0
+    num_batches = 0
+
+    for _ in range(NUM_M_STEP_EPOCHS):
+        epoch_loss = 0
+        for y_batch, sampled_onehot in tqdm(loader_with_labels):
+            y_batch, sampled_onehot = y_batch.to(DEVICE), sampled_onehot.to(DEVICE)  # (B, 1, 28, 28), (B, K)
+            optimizer.zero_grad()
+
+            # 前向传播
+            recon, mu, logvar = model(y_batch, sampled_onehot)
+
+            # VAE 损失
+            recon_loss_part = F.binary_cross_entropy(recon, y_batch, reduction='none').sum(dim=[1, 2, 3])
+            kld_part = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+
+            # 使用 beta 加权 KL 散度
+            loss = (recon_loss_part + beta * kld_part).mean()
+
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            total_loss += loss.item()
+            num_batches += 1
+
+        print(f"  Sampled M-Step Epoch Loss: {epoch_loss / len(loader_with_labels):.4f}")
+
+    avg_loss = total_loss / num_batches
+    return new_label_priors, avg_loss
+
+
+# -----------------
+# 1. 在脚本开头定义超参数
+# -----------------
+# 对比损失的权重。这是一个关键的超参数，需要调试。
+# 建议从 0.1, 0.5, 1.0 开始尝试。
+lambda_contrast = 0.5
+
+def m_step_contrastive(model, optimizer, dataloader, gamma, beta=1.0):
+    """
+    M-Step with Contrastive Learning for VAE.
+    在潜空间的均值向量 mu 上施加斥力。
+    """
+    model.train()
+
+    # --- 这部分与您之前的逻辑完全相同：采样标签、计算新先验、创建DataLoader ---
+    class_counts = torch.zeros(NUM_CLASSES, device=DEVICE)
+    sampled_labels = torch.multinomial(gamma, num_samples=1).squeeze(1).to(DEVICE)
+    class_counts += torch.bincount(sampled_labels, minlength=NUM_CLASSES).float()
+    new_label_priors = class_counts / class_counts.sum()
+
+    sampled_onehot = F.one_hot(sampled_labels, NUM_CLASSES).float()
+    dataset_with_labels = TensorDataset(dataloader.tensors[0], sampled_onehot)
+    loader_with_labels = DataLoader(dataset_with_labels, batch_size=BATCH_SIZE, shuffle=True)
+    # --- 采样逻辑结束 ---
+
+    print("Performing Contrastive M-Step for VAE...")
+    total_loss = 0
+    num_batches = 0
+
+    for _ in range(NUM_M_STEP_EPOCHS):
+        epoch_loss = 0
+        for y_batch, x_correct_onehot in tqdm(loader_with_labels):
+            y_batch, x_correct_onehot = y_batch.to(DEVICE), x_correct_onehot.to(DEVICE)
+            batch_size = y_batch.size(0)
+            optimizer.zero_grad()
+            
+            # ======================= 对比学习核心修改 =======================
+            
+            # 1. 生成“错误”标签 x_wrong
+            x_correct_indices = torch.argmax(x_correct_onehot, dim=1)
+            rand_offset = torch.randint(1, NUM_CLASSES, (batch_size,), device=DEVICE)
+            x_wrong_indices = (x_correct_indices + rand_offset) % NUM_CLASSES
+            x_wrong_onehot = F.one_hot(x_wrong_indices, NUM_CLASSES).float()
+
+            # 2. 高效地进行两次编码
+            # 我们将 correct 和 wrong 的输入拼接，只调用一次编码器
+            y_combined = torch.cat([y_batch, y_batch], dim=0)
+            x_combined = torch.cat([x_correct_onehot, x_wrong_onehot], dim=0)
+            
+            # 编码器输出两倍批次大小的 mu 和 logvar
+            mu_combined, logvar_combined = model.encode(y_combined, x_combined)
+            
+            # 拆分回 correct 和 wrong 两部分
+            mu_correct, mu_wrong = torch.chunk(mu_combined, 2, dim=0)
+            logvar_correct, _ = torch.chunk(logvar_combined, 2, dim=0) # logvar_wrong 不需要
+
+            # 3. 计算“引力”部分：标准的 VAE 损失
+            # 这部分需要完整的重构过程
+            z_correct = model.reparameterize(mu_correct, logvar_correct)
+            recon_correct = model.decode(z_correct, x_correct_onehot)
+            
+            recon_loss = F.binary_cross_entropy(recon_correct, y_batch, reduction='none').sum(dim=[1, 2, 3])
+            kld_loss = -0.5 * torch.sum(1 + logvar_correct - mu_correct.pow(2) - logvar_correct.exp(), dim=1)
+            
+            standard_loss = (recon_loss + beta * kld_loss).mean()
+
+            # 4. 计算“斥力”部分：对比损失
+            # 我们希望 mu_correct 和 mu_wrong 尽可能远
+            # 最大化 ||mu_correct - mu_wrong||^2 等价于最小化 -||mu_correct - mu_wrong||^2
+            contrastive_loss = -F.mse_loss(mu_correct, mu_wrong)
+
+            # 5. 合并总损失
+            total_loss_batch = standard_loss + lambda_contrast * contrastive_loss
+            
+            # ======================= 修改结束 =======================
+
+            total_loss_batch.backward()
+            optimizer.step()
+
+            epoch_loss += total_loss_batch.item()
+            num_batches += 1
+            
+        print(f"  Contrastive M-Step Epoch Loss: {epoch_loss / len(loader_with_labels):.4f}")
+        
+    avg_loss = (total_loss + epoch_loss) / num_batches  # 修正avg_loss的计算
+    return new_label_priors, avg_loss
+
+
 
 # --- 6. 结果评估 ---
 def validation(model, epoch, test_loader, label_priors, num_classes, device, latent_dim, save_dir=SAVE_PATH):
@@ -268,7 +432,7 @@ def validation(model, epoch, test_loader, label_priors, num_classes, device, lat
             gen_x_onehot = F.one_hot(gen_labels, num_classes).to(device).float()
             
             generated_images = model.decode(z_samples, gen_x_onehot).cpu()
-            save_path = os.path.join(save_dir, f"generated_samples_epoch_{epoch}.png")  
+            save_path = os.path.join(save_dir, f"samples/generated_samples_epoch_{epoch}.png")  
             save_image(generated_images,
                save_path,
                nrow=num_gens_per_class)
@@ -292,7 +456,17 @@ def loss_plot(loss_history, save_path=os.path.join(SAVE_PATH, "loss_plot.png")):
 
 
 # --- 5. 训练主循环 ---
-
+# # load model
+# sup_load_path = 'results_em_cvae_supervised'
+# model_path = os.path.join(sup_load_path, 'model/cvae_mnist.pth')
+# model = ConditionalVAE_CNN(latent_dim=LATENT_DIM, num_classes=NUM_CLASSES).to(DEVICE)
+# try:
+#     model.load_state_dict(torch.load(model_path, weights_only=False, map_location=DEVICE))
+#     print("Model loaded successfully.")
+# except Exception as e:
+#     print(f"Error loading model: {e}")
+#     exit()
+    
 model = ConditionalVAE_CNN(latent_dim=LATENT_DIM, num_classes=NUM_CLASSES).to(DEVICE)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -302,15 +476,34 @@ label_priors = torch.ones(NUM_CLASSES, device=DEVICE) / NUM_CLASSES
 
 # 记录loss
 loss_history = []
+# beta 从0线性增长到1，假设在前50个EM epoch完成
+beta_anneal_epochs = 20 
+
 
 for em_epoch in range(NUM_EM_EPOCHS):
     print(f"\n--- EM Epoch {em_epoch + 1}/{NUM_EM_EPOCHS} ---")
+
+    # 计算当前epoch的beta值
+    current_beta = 1.0
+    # current_beta = min(1.0, em_epoch / beta_anneal_epochs)
+    # print(f"Current Beta: {current_beta:.4f}")
     # E-Step
     gamma, _ = e_step(model, full_train_loader, label_priors, NUM_CLASSES, DEVICE)
     
     # M-Step
     # 注意这里我们将整个训练数据和计算好的gamma传入
-    new_label_priors, epoch_loss = m_step(model, optimizer, TensorDataset(full_train_dataset_tensors[0], full_train_dataset_tensors[1]), gamma)
+    # new_label_priors, epoch_loss = m_step(model, optimizer, TensorDataset(full_train_dataset_tensors[0], full_train_dataset_tensors[1]), gamma, current_beta)
+    # new_label_priors, epoch_loss = m_step_sampled(model, optimizer, 
+    #                                               TensorDataset(full_train_dataset_tensors[0],
+    #                                                             full_train_dataset_tensors[1]), 
+    #                                               gamma, 
+    #                                               current_beta)
+    new_label_priors, epoch_loss = m_step_contrastive(model, optimizer, 
+                                                  TensorDataset(full_train_dataset_tensors[0],
+                                                                full_train_dataset_tensors[1]), 
+                                                  gamma, 
+                                                  current_beta)
+                                                  
     loss_history.append(epoch_loss)
 
     if (em_epoch + 1) % 10 == 0:
@@ -324,6 +517,7 @@ for em_epoch in range(NUM_EM_EPOCHS):
         validation(model, em_epoch + 1, val_loader, label_priors, NUM_CLASSES, DEVICE, LATENT_DIM)
         # 绘制loss图表
         loss_plot(loss_history, os.path.join(SAVE_PATH, f"loss/loss_plot_epoch_{em_epoch + 1}.png"))
+
 
 print("\n--- Training Finished ---")
 # 保存模型
