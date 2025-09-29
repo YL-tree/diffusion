@@ -2,6 +2,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# =================================================================
+#  == 新增部分：辅助分类器网络 ==
+# =================================================================
+class Classifier(nn.Module):
+    """一个简单的CNN分类器，用于识别生成的图像"""
+    def __init__(self, num_classes):
+        super(Classifier, self).__init__()
+        self.conv_stack = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1), # -> 14x14
+            nn.LeakyReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), # -> 7x7
+            nn.LeakyReLU(),
+        )
+        self.fc_stack = nn.Sequential(
+            nn.Linear(32 * 7 * 7, 128),
+            nn.LeakyReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.conv_stack(x)
+        x = x.view(x.size(0), -1) # Flatten
+        return self.fc_stack(x)
+        
 class ConditionalVAE_CrossAttention(nn.Module):
     def __init__(self, latent_dim, num_classes):
         super(ConditionalVAE_CrossAttention, self).__init__()

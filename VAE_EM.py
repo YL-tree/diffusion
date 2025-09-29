@@ -4,6 +4,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 from VAE_config import *
+from torchvision.utils import save_image
 from scipy.stats import mode
 import os
 
@@ -15,10 +16,11 @@ def e_step(model, dataloader, label_priors, num_classes, device, beta=1.0):
     """
     model.eval()
     all_gamma = []
+    all_true_labels = []
     
     print("Performing E-Step (using full weighted ELBO)...")
     with torch.no_grad():
-        for y_batch, _ in tqdm(dataloader):
+        for y_batch, true_labels in tqdm(dataloader):
             y_batch = y_batch.to(device)
             batch_size = y_batch.size(0)
 
@@ -46,8 +48,9 @@ def e_step(model, dataloader, label_priors, num_classes, device, beta=1.0):
             log_gamma = log_p_y_x - log_p_y
             gamma_batch = torch.exp(log_gamma)
             all_gamma.append(gamma_batch.cpu())
+            all_true_labels.append(true_labels)
 
-    return torch.cat(all_gamma, dim=0) # 不再需要返回true_labels
+    return torch.cat(all_gamma, dim=0), torch.cat(all_true_labels, dim=0)
 
 def m_step(model, optimizer, dataloader, gamma, beta=1.0):
     """
@@ -227,9 +230,11 @@ def m_step_contrastive(model, optimizer, dataloader, gamma, beta=1.0):
             # 5. 合并总损失
             total_loss_batch = standard_loss + lambda_contrast * contrastive_loss
             
-            # ======================= 修改结束 =======================
-
             total_loss_batch.backward()
+            # 防止梯度爆炸
+            # Clips the gradients to a maximum norm of 1.0. This is a common value.
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # --------------------
             optimizer.step()
 
             epoch_loss += total_loss_batch.item()
@@ -241,6 +246,89 @@ def m_step_contrastive(model, optimizer, dataloader, gamma, beta=1.0):
     avg_loss = total_loss / num_batches  # 修正avg_loss的计算
     return new_label_priors, avg_loss
 
+# =================================================================
+#  == 核心修改：带有自洽性约束的M-Step ==
+# =================================================================
+def m_step_with_classifier(
+    generator, classifier, optimizer_g, optimizer_c,
+    dataloader, gamma, beta=1.0, lambda_consistency=1.0
+):
+    """
+    M-Step with a self-consistency classifier loss.
+    
+    Args:
+        generator: The VAE model.
+        classifier: The auxiliary classifier model.
+        optimizer_g: Optimizer for the generator (VAE).
+        optimizer_c: Optimizer for the classifier.
+        dataloader: Provides the raw image data.
+        gamma: The soft labels from the E-step.
+        beta: Weight for the KL divergence term.
+        lambda_consistency: Weight for the new classifier consistency loss.
+    """
+    generator.train()
+    classifier.train()
+
+    # --- 采样伪标签 (与您之前的逻辑相同) ---
+    sampled_labels = torch.multinomial(gamma, num_samples=1).squeeze(1).to(DEVICE)
+    class_counts = torch.bincount(sampled_labels, minlength=NUM_CLASSES).float()
+    new_label_priors = class_counts / class_counts.sum()
+    sampled_onehot = F.one_hot(sampled_labels, NUM_CLASSES).float()
+    
+    dataset_with_labels = TensorDataset(dataloader.tensors[0], sampled_onehot, sampled_labels)
+    loader_with_labels = DataLoader(dataset_with_labels, batch_size=BATCH_SIZE, shuffle=True)
+    
+    print("Performing M-Step with Classifier Self-Consistency...")
+    total_g_loss = 0
+    total_c_loss = 0
+    num_batches = 0
+
+    for _ in range(NUM_M_STEP_EPOCHS):
+        for y_batch, x_onehot, x_indices in tqdm(loader_with_labels):
+            y_batch, x_onehot, x_indices = y_batch.to(DEVICE), x_onehot.to(DEVICE), x_indices.to(DEVICE)
+            
+            # --- 步骤 1: 训练生成器 (VAE) ---
+            optimizer_g.zero_grad()
+            
+            # 1a. 标准VAE前向传播和损失
+            recon, mu, logvar = generator(y_batch, x_onehot)
+            recon_loss = F.binary_cross_entropy(recon, y_batch, reduction='none').sum(dim=[1, 2, 3])
+            kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+            vae_loss = (recon_loss + beta * kld_loss).mean()
+
+            # 1b. 新增：自洽性损失 (Consistency Loss)
+            # 让分类器来判断VAE生成的图像
+            logits_from_generated = classifier(recon)
+            # 损失的目标是E-step给出的伪标签
+            consistency_loss = F.cross_entropy(logits_from_generated, x_indices)
+
+            # 1c. 合并生成器的总损失
+            total_loss_g = vae_loss + lambda_consistency * consistency_loss
+            
+            total_loss_g.backward()
+            optimizer_g.step()
+
+            # --- 步骤 2: 独立训练分类器 ---
+            optimizer_c.zero_grad()
+            
+            # 使用 .detach() 来阻断梯度流回生成器
+            # 分类器的唯一任务是：学会识别生成器当前生成的东西
+            logits_for_classifier = classifier(recon.detach())
+            loss_c = F.cross_entropy(logits_for_classifier, x_indices)
+            
+            loss_c.backward()
+            optimizer_c.step()
+
+            total_g_loss += total_loss_g.item()
+            total_c_loss += loss_c.item()
+            num_batches += 1
+            
+    avg_g_loss = total_g_loss / num_batches
+    avg_c_loss = total_c_loss / num_batches
+    print(f"  M-Step Avg Generator Loss: {avg_g_loss:.4f}, Avg Classifier Loss: {avg_c_loss:.4f}")
+    
+    return new_label_priors, avg_g_loss
+    
 # 损失函数: Negative ELBO
 def loss_function(recon_y, y, mu, logvar):
     # recon_y: (N, 1, 28, 28), y: (N, 1, 28, 28)
