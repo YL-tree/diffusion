@@ -239,6 +239,42 @@ def evaluate_model(model, loader, cfg):
 
 
 # ============================================================
+# Diagnostic: x-conditionality score
+# ============================================================
+@torch.no_grad()
+def measure_x_conditionality(model, cfg, n_z=20):
+    """
+    测量 decoder 对 x 的依赖程度。
+    固定 z, 改变 x, 看输出变化有多大。
+    返回 0~1 之间的分数: 0=完全忽略x, 1=强依赖x
+
+    这是最关键的诊断指标 — 如果 xcond≈0 说明 x 坍缩了。
+    """
+    model.eval()
+    K = cfg.num_classes
+    z = torch.randn(n_z, cfg.latent_dim).to(cfg.device)
+
+    outputs = []
+    for k in range(K):
+        y_onehot = F.one_hot(
+            torch.full((n_z,), k, device=cfg.device, dtype=torch.long), K).float()
+        out = model.dec(z, y_onehot)
+        outputs.append(out)
+    outputs = torch.stack(outputs, dim=0)  # [K, n_z, C, H, W]
+
+    # 对每个 z 样本, 计算不同 x 输出之间的标准差
+    # outputs[:, i, :] 是同一个 z_i 在不同 x 下的 K 个输出
+    std_across_x = outputs.std(dim=0)  # [n_z, C, H, W]
+    mean_std = std_across_x.mean().item()
+
+    # 归一化: 用整体像素值的标准差做参考
+    pixel_std = outputs.std().item() + 1e-9
+    score = mean_std / pixel_std
+
+    return min(score, 1.0)
+
+
+# ============================================================
 # Training: Unsupervised
 # ============================================================
 def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
@@ -246,23 +282,23 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
     total_epochs = cfg.final_epochs if is_final else cfg.optuna_epochs
     beta_target = cfg.beta
     best_nmi = 0.0
+    best_acc = 0.0
 
     for epoch in range(1, total_epochs + 1):
         model.train()
         ep_recon, ep_kl, ep_prior, ep_post, ep_ent = 0, 0, 0, 0, 0
         n_batches = 0
 
-        # Beta annealing
+        # Beta annealing (线性 warmup)
         if is_final and epoch <= cfg.kl_anneal_epochs:
             cfg.beta = beta_target * (epoch / cfg.kl_anneal_epochs)
         else:
             cfg.beta = beta_target
 
-        # Tau annealing (后半段)
-        if epoch > total_epochs * 0.3:
-            cfg.current_gumbel_temp = max(
-                cfg.min_gumbel_temp,
-                cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
+        # ★ Tau annealing: 从 epoch 1 就开始退火! (不再延迟)
+        cfg.current_gumbel_temp = max(
+            cfg.min_gumbel_temp,
+            cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
 
         for y_img, _ in train_loader:
             y_img = y_img.to(cfg.device)
@@ -282,13 +318,21 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
 
         # Evaluate
         nmi, post_acc, val_loss = evaluate_model(model, val_loader, cfg)
-        if nmi > best_nmi:
-            best_nmi = nmi
+
+        # ★ 用 post_acc 选 best model (而非 NMI — NMI 高不代表 x 被使用)
+        if post_acc > best_acc:
+            best_acc = post_acc
             if is_final:
                 torch.save(model.state_dict(),
                            os.path.join(cfg.output_dir, "best_model.pt"))
+        best_nmi = max(best_nmi, nmi)
 
         pi_np = model.pi.detach().cpu().numpy()
+
+        # ★ 诊断: x-conditionality score (decoder 对不同 x 的差异有多大)
+        x_cond = 0.0
+        if is_final and epoch % 5 == 0:
+            x_cond = measure_x_conditionality(model, cfg)
 
         if logger:
             logger.log(
@@ -306,9 +350,10 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
             )
 
         if is_final:
+            cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
             print(f"  Ep {epoch:3d}/{total_epochs} | NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep_recon/n_batches:.1f} KL={ep_kl/n_batches:.2f} "
-                  f"β={cfg.beta:.2f} τ={cfg.current_gumbel_temp:.3f}")
+                  f"β={cfg.beta:.2f} τ={cfg.current_gumbel_temp:.3f}{cond_str}")
 
     cfg.beta = beta_target
     return best_nmi
@@ -322,23 +367,23 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
     total_epochs = cfg.final_epochs if is_final else cfg.optuna_epochs
     beta_target = cfg.beta
     best_nmi = 0.0
+    best_acc = 0.0
 
     for epoch in range(1, total_epochs + 1):
         model.train()
         ep_recon, ep_kl, ep_prior, ep_post, ep_ent = 0, 0, 0, 0, 0
         n_batches = 0
 
-        # Beta annealing
+        # Beta annealing (线性 warmup)
         if is_final and epoch <= cfg.kl_anneal_epochs:
             cfg.beta = beta_target * (epoch / cfg.kl_anneal_epochs)
         else:
             cfg.beta = beta_target
 
-        # Tau annealing
-        if epoch > total_epochs * 0.3:
-            cfg.current_gumbel_temp = max(
-                cfg.min_gumbel_temp,
-                cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
+        # ★ Tau annealing: 从 epoch 1 就开始! (不再延迟)
+        cfg.current_gumbel_temp = max(
+            cfg.min_gumbel_temp,
+            cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
 
         for (x_lab, y_lab), (x_un, _) in zip(labeled_loader, unlabeled_loader):
             x_lab = x_lab.to(cfg.device)
@@ -364,13 +409,21 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
 
         # Evaluate
         nmi, post_acc, val_loss = evaluate_model(model, val_loader, cfg)
-        if nmi > best_nmi:
-            best_nmi = nmi
+
+        # ★ 用 post_acc 选 best model
+        if post_acc > best_acc:
+            best_acc = post_acc
             if is_final:
                 torch.save(model.state_dict(),
                            os.path.join(cfg.output_dir, "best_model.pt"))
+        best_nmi = max(best_nmi, nmi)
 
         pi_np = model.pi.detach().cpu().numpy()
+
+        # ★ 诊断: x-conditionality
+        x_cond = 0.0
+        if is_final and epoch % 5 == 0:
+            x_cond = measure_x_conditionality(model, cfg)
 
         if logger:
             logger.log(
@@ -388,9 +441,10 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
             )
 
         if is_final:
+            cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
             print(f"  Ep {epoch:3d}/{total_epochs} | NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep_recon/n_batches:.1f} KL={ep_kl/n_batches:.2f} "
-                  f"β={cfg.beta:.2f} τ={cfg.current_gumbel_temp:.3f}")
+                  f"β={cfg.beta:.2f} τ={cfg.current_gumbel_temp:.3f}{cond_str}")
 
     cfg.beta = beta_target
     return best_nmi
@@ -811,7 +865,7 @@ def fig14_summary_table(logger, cfg, save_path, mode="unsup"):
     final_acc = accs[-1]
     final_pi = logger.records['pi_values'][-1]
 
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig, ax = plt.subplots(figsize=(8, 5))
     ax.axis('off')
     table_data = [
         ["Mode", mode],
@@ -835,6 +889,37 @@ def fig14_summary_table(logger, cfg, save_path, mode="unsup"):
     ax.set_title("Training Summary", fontsize=14, fontweight='bold', pad=20)
     plt.tight_layout(); plt.savefig(save_path); plt.close()
     print(f"  ✓ fig14_summary_table → {save_path}")
+
+
+def fig15_x_conditionality(model, cfg, save_path, n_z=5):
+    """
+    ★ 关键诊断图: 固定 z, 改变 x → 观察生成图是否变化
+    如果每列(同一z)下所有行(不同x)看起来一样 → x 被忽略了(坍缩)
+    如果每列不同行有明显差异 → x 被正确使用
+    """
+    model.eval()
+    K = cfg.num_classes
+
+    fig, axes = plt.subplots(K, n_z, figsize=(n_z * 1.5, K * 1.3))
+    with torch.no_grad():
+        for j in range(n_z):
+            z = torch.randn(1, cfg.latent_dim).to(cfg.device)
+            for k in range(K):
+                y_onehot = F.one_hot(
+                    torch.tensor([k], device=cfg.device), K).float()
+                img = model.dec(z, y_onehot)
+                axes[k, j].imshow(img[0, 0].cpu(), cmap='gray')
+                axes[k, j].axis('off')
+            axes[0, j].set_title(f"z_{j}", fontsize=8)
+        for k in range(K):
+            axes[k, 0].set_ylabel(f"x={k}", fontsize=8, rotation=0, labelpad=20)
+
+    xcond = measure_x_conditionality(model, cfg)
+    fig.suptitle(f"x-Conditionality Check (xcond={xcond:.3f})\n"
+                 f"Same z per column, different x per row",
+                 fontsize=12, fontweight='bold')
+    plt.tight_layout(); plt.savefig(save_path); plt.close()
+    print(f"  ✓ fig15_x_conditionality → {save_path}")
 
 
 # ============================================================
@@ -868,10 +953,22 @@ def generate_all_figures(model, logger, loader, cfg, mode="unsup"):
     fig12_gumbel_resp_heatmap(model, loader, cfg, os.path.join(fig_dir, "fig12_resp_heatmap.png"))
     fig13_interpolation(model, cfg, os.path.join(fig_dir, "fig13_interpolation.png"))
     fig14_summary_table(logger, cfg, os.path.join(fig_dir, "fig14_summary_table.png"), mode)
+    fig15_x_conditionality(model, cfg, os.path.join(fig_dir, "fig15_x_conditionality.png"))
 
     # 保存 logger
     logger.save(os.path.join(fig_dir, "training_log.json"))
-    print(f"\n✅ All figures saved to {fig_dir}/")
+
+    # ★ 最终 x-conditionality 得分
+    xcond = measure_x_conditionality(model, cfg)
+    print(f"\n★ Final x-conditionality score: {xcond:.4f}")
+    if xcond < 0.3:
+        print("  ⚠️  WARNING: Decoder largely ignores x! Consider reducing latent_dim further.")
+    elif xcond > 0.6:
+        print("  ✅  Decoder properly uses x as conditioning.")
+    else:
+        print("  🟡  Decoder partially uses x. May improve with more training.")
+
+    print(f"\n✅ All 15 figures saved to {fig_dir}/")
 
 
 # ============================================================
@@ -882,10 +979,11 @@ def run_optuna(mode, n_trials=15):
 
     def objective(trial):
         cfg = Config()
-        cfg.latent_dim = trial.suggest_categorical("latent_dim", [2, 8, 16, 32])
-        cfg.beta = trial.suggest_float("beta", 0.1, 5.0)
+        cfg.latent_dim = trial.suggest_categorical("latent_dim", [2, 4, 8])  # ★ 不要 16/32
+        cfg.beta = trial.suggest_float("beta", 0.1, 2.0)  # ★ 上限从 5→2
         cfg.lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
-        cfg.init_gumbel_temp = trial.suggest_float("init_gumbel_temp", 0.3, 1.0)
+        cfg.init_gumbel_temp = trial.suggest_float("init_gumbel_temp", 0.2, 0.7)  # ★ 更低范围
+        cfg.gumbel_anneal_rate = trial.suggest_float("gumbel_anneal_rate", 0.96, 0.995)  # ★ 新增
         cfg.current_gumbel_temp = cfg.init_gumbel_temp
 
         if mode == "semisup":
@@ -916,9 +1014,9 @@ def run_optuna(mode, n_trials=15):
 def main():
     parser = argparse.ArgumentParser(description="mVAE Paper-Aligned Training")
     parser.add_argument("--mode", type=str, default="unsup", choices=["unsup", "semisup"])
-    parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--latent_dim", type=int, default=16)
-    parser.add_argument("--beta", type=float, default=1.0)
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--latent_dim", type=int, default=4)
+    parser.add_argument("--beta", type=float, default=0.5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--labeled_per_class", type=int, default=100)
