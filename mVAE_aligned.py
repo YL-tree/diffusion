@@ -243,22 +243,36 @@ def evaluate_model(model, loader, cfg):
 
 
 # ============================================================
-# Diagnostic: x-conditionality score
+# Diagnostic: x-conditionality score (修正版)
 # ============================================================
 @torch.no_grad()
-def measure_x_conditionality(model, cfg, n_z=20):
+def measure_x_conditionality(model, loader, cfg, n_z=50):
     """
-    测量 decoder 对 x 的依赖程度。
-    固定 z, 改变 x, 看输出变化有多大。
-    返回 0~1 之间的分数: 0=完全忽略x, 1=强依赖x
+    测量 decoder 对 x 的依赖程度 (ANOVA 风格分解)。
 
-    这是最关键的诊断指标 — 如果 xcond≈0 说明 x 坍缩了。
+    方法: 取真实图像编码的 z, 对每个 z 用所有 K 个 x 解码,
+    然后计算:
+        Var_x = 固定 z 时, 改变 x 引起的方差 (平均)
+        Var_z = 固定 x 时, 改变 z 引起的方差 (平均)
+        xcond = Var_x / (Var_x + Var_z)
+
+    返回 0~1: 0=完全忽略x, 0.5=x和z同等重要, 1=只依赖x
     """
     model.eval()
     K = cfg.num_classes
-    z = torch.randn(n_z, cfg.latent_dim).to(cfg.device)
 
-    outputs = []
+    # ★ 用真实图像编码的 z (不是随机 z!)
+    zs = []
+    for y_img, _ in loader:
+        y_img = y_img.to(cfg.device)
+        mu, _ = model.enc(y_img)
+        zs.append(mu)
+        if sum(z.size(0) for z in zs) >= n_z:
+            break
+    z = torch.cat(zs)[:n_z]  # [n_z, latent_dim]
+
+    # 对每个 z, 用所有 K 个 x 解码
+    outputs = []  # 将是 [K, n_z, C, H, W]
     for k in range(K):
         y_onehot = F.one_hot(
             torch.full((n_z,), k, device=cfg.device, dtype=torch.long), K).float()
@@ -266,16 +280,21 @@ def measure_x_conditionality(model, cfg, n_z=20):
         outputs.append(out)
     outputs = torch.stack(outputs, dim=0)  # [K, n_z, C, H, W]
 
-    # 对每个 z 样本, 计算不同 x 输出之间的标准差
-    # outputs[:, i, :] 是同一个 z_i 在不同 x 下的 K 个输出
-    std_across_x = outputs.std(dim=0)  # [n_z, C, H, W]
-    mean_std = std_across_x.mean().item()
+    # 展平像素维度: [K, n_z, D]
+    D = outputs[0].numel() // n_z
+    flat = outputs.reshape(K, n_z, D)
 
-    # 归一化: 用整体像素值的标准差做参考
-    pixel_std = outputs.std().item() + 1e-9
-    score = mean_std / pixel_std
+    # Var_x: 固定 z, x 变化的方差, 然后对 z 和 D 取平均
+    var_x = flat.var(dim=0).mean().item()   # var over K, mean over n_z, D
 
-    return min(score, 1.0)
+    # Var_z: 固定 x, z 变化的方差, 然后对 x 和 D 取平均
+    var_z = flat.var(dim=1).mean().item()   # var over n_z, mean over K, D
+
+    # ANOVA 比例
+    total = var_x + var_z + 1e-9
+    score = var_x / total
+
+    return score
 
 
 # ============================================================
@@ -339,7 +358,7 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
         # ★ 诊断: x-conditionality score (decoder 对不同 x 的差异有多大)
         x_cond = 0.0
         if is_final and epoch % 5 == 0:
-            x_cond = measure_x_conditionality(model, cfg)
+            x_cond = measure_x_conditionality(model, val_loader, cfg)
 
         if logger:
             logger.log(
@@ -432,7 +451,7 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
         # ★ 诊断: x-conditionality
         x_cond = 0.0
         if is_final and epoch % 5 == 0:
-            x_cond = measure_x_conditionality(model, cfg)
+            x_cond = measure_x_conditionality(model, val_loader, cfg)
 
         if logger:
             logger.log(
@@ -770,12 +789,17 @@ def fig10_loss_decomposition(logger, save_path):
     print(f"  ✓ fig10_loss_decomposition → {save_path}")
 
 
-def fig11_per_class_recon(model, loader, cfg, save_path, n_per_class=5):
-    """每个类的重建质量 (按类组织)"""
+def fig11_per_class_recon(model, loader, cfg, save_path, n_per_class=5, mode="unsup"):
+    """每个类的重建质量 (按类组织)
+
+    ★ 关键修正: 无监督下 cluster k ≠ digit k
+    使用 Hungarian 映射把真实标签转为对应的 cluster index
+    """
     model.eval()
     K = cfg.num_classes
     class_imgs = {k: [] for k in range(K)}
 
+    # 收集每类图像
     with torch.no_grad():
         for y_img, y_label in loader:
             for k in range(K):
@@ -786,20 +810,54 @@ def fig11_per_class_recon(model, loader, cfg, save_path, n_per_class=5):
             if all(len(v) >= n_per_class for v in class_imgs.values()):
                 break
 
+    # ★ 无监督模式: 计算 Hungarian 映射 (true_label → cluster_id)
+    label_to_cluster = None
+    if mode == "unsup":
+        # 用验证集计算映射
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for y_img, y_label in loader:
+                y_img = y_img.to(cfg.device)
+                _, info = model.forward_unlabeled(y_img, cfg)
+                if 'resp' in info and info['resp'] is not None:
+                    all_preds.append(info['resp'].argmax(dim=1).cpu().numpy())
+                    all_labels.append(y_label.numpy())
+                if sum(p.shape[0] for p in all_preds) > 2000:
+                    break
+        if all_preds:
+            all_preds = np.concatenate(all_preds)
+            all_labels = np.concatenate(all_labels)
+            _, mapping = compute_posterior_accuracy(all_preds, all_labels, K)
+            # mapping: cluster_id → true_label, 我们要反过来: true_label → cluster_id
+            label_to_cluster = {v: k for k, v in mapping.items()}
+
     fig, axes = plt.subplots(K, n_per_class * 2, figsize=(n_per_class * 3, K * 1.3))
     with torch.no_grad():
         for k in range(K):
             imgs = torch.stack(class_imgs[k][:n_per_class]).to(cfg.device)
             mu, _ = model.enc(imgs)
-            y_onehot = F.one_hot(torch.full((len(imgs),), k, device=cfg.device, dtype=torch.long),
-                                 K).float()
+
+            # ★ 选择正确的 cluster index
+            if label_to_cluster is not None:
+                cluster_k = label_to_cluster.get(k, k)  # 用映射后的 cluster
+            else:
+                cluster_k = k  # 半监督直接用真实标签
+
+            y_onehot = F.one_hot(
+                torch.full((len(imgs),), cluster_k, device=cfg.device, dtype=torch.long), K).float()
             recon = model.dec(mu, y_onehot)
+
             for i in range(n_per_class):
                 axes[k, i*2].imshow(imgs[i, 0].cpu(), cmap='gray'); axes[k, i*2].axis('off')
                 axes[k, i*2+1].imshow(recon[i, 0].cpu(), cmap='gray'); axes[k, i*2+1].axis('off')
-            axes[k, 0].set_ylabel(f"Class {k}", fontsize=8, rotation=0, labelpad=30)
 
-    fig.suptitle("Per-Class Reconstruction (Orig → Recon)", fontsize=13)
+            cluster_str = f" (c={cluster_k})" if label_to_cluster is not None else ""
+            axes[k, 0].set_ylabel(f"Digit {k}{cluster_str}", fontsize=7, rotation=0, labelpad=45)
+
+    title = "Per-Class Reconstruction (Orig → Recon)"
+    if mode == "unsup":
+        title += "\n(using Hungarian-aligned cluster assignments)"
+    fig.suptitle(title, fontsize=12)
     plt.tight_layout(); plt.savefig(save_path); plt.close()
     print(f"  ✓ fig11_per_class_recon → {save_path}")
 
@@ -900,19 +958,28 @@ def fig14_summary_table(logger, cfg, save_path, mode="unsup"):
     print(f"  ✓ fig14_summary_table → {save_path}")
 
 
-def fig15_x_conditionality(model, cfg, save_path, n_z=5):
+def fig15_x_conditionality(model, loader, cfg, save_path, n_z=5):
     """
     ★ 关键诊断图: 固定 z, 改变 x → 观察生成图是否变化
     如果每列(同一z)下所有行(不同x)看起来一样 → x 被忽略了(坍缩)
     如果每列不同行有明显差异 → x 被正确使用
+
+    ★ 使用真实编码的 z (不是随机 z)
     """
     model.eval()
     K = cfg.num_classes
 
+    # 取真实图像编码的 z
+    with torch.no_grad():
+        y_img, _ = next(iter(loader))
+        y_img = y_img[:n_z].to(cfg.device)
+        mu, _ = model.enc(y_img)
+        z_real = mu  # [n_z, latent_dim]
+
     fig, axes = plt.subplots(K, n_z, figsize=(n_z * 1.5, K * 1.3))
     with torch.no_grad():
         for j in range(n_z):
-            z = torch.randn(1, cfg.latent_dim).to(cfg.device)
+            z = z_real[j:j+1]  # [1, latent_dim]
             for k in range(K):
                 y_onehot = F.one_hot(
                     torch.tensor([k], device=cfg.device), K).float()
@@ -923,10 +990,11 @@ def fig15_x_conditionality(model, cfg, save_path, n_z=5):
         for k in range(K):
             axes[k, 0].set_ylabel(f"x={k}", fontsize=8, rotation=0, labelpad=20)
 
-    xcond = measure_x_conditionality(model, cfg)
+    xcond = measure_x_conditionality(model, loader, cfg)
     fig.suptitle(f"x-Conditionality Check (xcond={xcond:.3f})\n"
-                 f"Same z per column, different x per row",
-                 fontsize=12, fontweight='bold')
+                 f"Same z per column, different x per row\n"
+                 f"(ANOVA: 0=x ignored, 0.5=x≈z, 1=x dominant)",
+                 fontsize=11, fontweight='bold')
     plt.tight_layout(); plt.savefig(save_path); plt.close()
     print(f"  ✓ fig15_x_conditionality → {save_path}")
 
@@ -958,21 +1026,22 @@ def generate_all_figures(model, logger, loader, cfg, mode="unsup"):
     fig08_cluster_distribution(model, loader, cfg, os.path.join(fig_dir, "fig08_cluster_distribution.png"))
     fig09_reconstruction(model, loader, cfg, os.path.join(fig_dir, "fig09_reconstruction.png"))
     fig10_loss_decomposition(logger, os.path.join(fig_dir, "fig10_loss_decomposition.png"))
-    fig11_per_class_recon(model, loader, cfg, os.path.join(fig_dir, "fig11_per_class_recon.png"))
+    fig11_per_class_recon(model, loader, cfg, os.path.join(fig_dir, "fig11_per_class_recon.png"), mode=mode)
     fig12_gumbel_resp_heatmap(model, loader, cfg, os.path.join(fig_dir, "fig12_resp_heatmap.png"))
     fig13_interpolation(model, cfg, os.path.join(fig_dir, "fig13_interpolation.png"))
     fig14_summary_table(logger, cfg, os.path.join(fig_dir, "fig14_summary_table.png"), mode)
-    fig15_x_conditionality(model, cfg, os.path.join(fig_dir, "fig15_x_conditionality.png"))
+    fig15_x_conditionality(model, loader, cfg, os.path.join(fig_dir, "fig15_x_conditionality.png"))
 
     # 保存 logger
     logger.save(os.path.join(fig_dir, "training_log.json"))
 
-    # ★ 最终 x-conditionality 得分
-    xcond = measure_x_conditionality(model, cfg)
-    print(f"\n★ Final x-conditionality score: {xcond:.4f}")
-    if xcond < 0.3:
-        print("  ⚠️  WARNING: Decoder largely ignores x! Consider reducing latent_dim further.")
-    elif xcond > 0.6:
+    # ★ 最终 x-conditionality 得分 (ANOVA 分解)
+    xcond = measure_x_conditionality(model, loader, cfg)
+    print(f"\n★ Final x-conditionality score (ANOVA): {xcond:.4f}")
+    print(f"  (0=x被忽略, 0.5=x和z同等重要, 1=只依赖x)")
+    if xcond < 0.15:
+        print("  ⚠️  WARNING: Decoder largely ignores x!")
+    elif xcond > 0.3:
         print("  ✅  Decoder properly uses x as conditioning.")
     else:
         print("  🟡  Decoder partially uses x. May improve with more training.")
