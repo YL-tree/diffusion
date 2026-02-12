@@ -19,30 +19,30 @@ from scipy.optimize import linear_sum_assignment
 # ============================================================
 class Config:
     # --- 模型 ---
-    latent_dim = 4                 # ★ 16→4: 强迫 decoder 依赖 x 而非把一切塞进 z
+    latent_dim = 2                 # ★★ 4→2: z 只有2维,必须依赖 x
     hidden_dim = 256
     num_classes = 10
 
     # --- 论文公式参数 ---
-    beta = 0.5                     # ★ 1.0→0.5: 避免 z 被过度压缩
-    use_bce = True                 # True=BCE(Bernoulli), False=MSE(Gaussian)
+    beta = 2.0                     # ★★ 0.5→2.0: 强力压缩 z
+    use_bce = True
 
     # --- Gumbel softmax ---
-    init_gumbel_temp = 0.5         # ★ 0.7→0.5: 更低起点
-    min_gumbel_temp = 0.05         # ★ 0.1→0.05: 允许更尖锐的 resp
-    gumbel_anneal_rate = 0.98      # ★ 0.995→0.98: 更快退火
+    init_gumbel_temp = 0.3         # ★★ 0.5→0.3: 从一开始就接近 one-hot
+    min_gumbel_temp = 0.05
+    gumbel_anneal_rate = 0.97      # ★★ 0.98→0.97: 更快退火
     current_gumbel_temp = init_gumbel_temp
 
     # --- 半监督 ---
-    alpha_unlabeled = 0.5          # ★ 1.0→0.5: 降低无标签权重,让标签信号更强
-    labeled_per_class = 100        # 每类有标签样本数
+    alpha_unlabeled = 0.5
+    labeled_per_class = 100
 
     # --- 训练 ---
     lr = 1e-3
     batch_size = 128
     optuna_epochs = 15
-    final_epochs = 80              # ★ 60→80: 更多训练周期
-    kl_anneal_epochs = 20          # ★ 10→20: 更慢的 KL warmup
+    final_epochs = 80
+    kl_anneal_epochs = 5           # ★★ 20→5: β 在 5 个 epoch 内就到位
 
     # --- 设备 ---
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
