@@ -1,5 +1,6 @@
 # mVAE_common.py
 # 公共组件：网络结构、工具函数、可视化（严格对齐论文 Section 2.2）
+# ★★ v2 修改: 修复 x-collapse 问题
 
 import os, json, time
 import torch
@@ -19,20 +20,24 @@ from scipy.optimize import linear_sum_assignment
 # ============================================================
 class Config:
     # --- 模型 ---
-    latent_dim = 4                 # 4维: 平衡 z 容量与 x 依赖
+    latent_dim = 2                 # ★★ v2: 4→2, 更强瓶颈迫使 x 被使用
     hidden_dim = 256
     num_classes = 10
 
     # --- 论文公式参数 ---
     beta = 1.0                     # 最终 β 目标值
-    beta_init = 3.0                # ★★ 逆向退火: 起始 β 高, 先强制 x 被使用
+    beta_init = 5.0                # ★★ v2: 3→5, 更强逆向退火
     use_bce = True
 
     # --- Gumbel softmax ---
-    init_gumbel_temp = 0.3
+    init_gumbel_temp = 0.5         # ★★ v2: 0.3→0.5, 初期稍软以便学习
     min_gumbel_temp = 0.05
     gumbel_anneal_rate = 0.97
     current_gumbel_temp = init_gumbel_temp
+
+    # --- ★★ v2 新增: 打破 x-collapse 的参数 ---
+    hard_gumbel_epochs = 20        # 前 N 个 epoch 用 straight-through hard Gumbel
+    logit_mix_alpha = 0.1          # 混合 non-detached logits 的比例 (0=纯论文, 1=全 live)
 
     # --- 半监督 ---
     alpha_unlabeled = 0.5
@@ -43,8 +48,8 @@ class Config:
     batch_size = 128
     optuna_epochs = 15
     final_epochs = 80
-    kl_anneal_epochs = 15          # β 从 beta_init 退火到 beta 用 15 epoch
-    decoder_type = 'film'          # ★★ 'concat'=旧版, 'film'=FiLM条件化
+    kl_anneal_epochs = 20          # ★★ v2: 15→20, 配合更强 beta_init
+    decoder_type = 'film'          # 'concat'=旧版, 'film'=FiLM条件化
 
     # --- 设备 ---
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -92,12 +97,6 @@ class ConditionalDecoder(nn.Module):
 
 # ============================================================
 # FiLM Decoder (★★ 强条件化 — decoder 结构性依赖 x)
-#
-# 原理: x 不是和 z 拼接, 而是通过 FiLM 层调制 z 的每一层特征
-#       h_l = γ_l(x) ⊙ h_l + β_l(x)
-# 这使得 decoder 在数学上不可能忽略 x:
-#   - 如果忽略 x, γ=1, β=0, 相当于无条件解码, 对10类输出相同
-#   - 要产生不同类的图像, 必须使用 x 来调制
 # ============================================================
 class FiLMDecoder(nn.Module):
     def __init__(self, latent_dim=4, num_classes=10, hidden_dim=256):
@@ -177,10 +176,28 @@ class FiLMDecoder(nn.Module):
 def reparameterize(mu, logvar):
     return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
 
-def gumbel_softmax_sample(logits, temperature):
+
+def gumbel_softmax_sample(logits, temperature, hard=False):
+    """
+    Gumbel softmax 采样。
+
+    ★★ v2 新增 hard 模式:
+    - hard=False: 标准 soft Gumbel (原版)
+    - hard=True:  Straight-through Gumbel
+                  前向: one-hot (明确分配到某一类)
+                  反向: soft 梯度 (可微)
+    """
     noise = torch.rand_like(logits)
     gumbel = -torch.log(-torch.log(noise + 1e-9) + 1e-9)
-    return F.softmax((logits + gumbel) / (temperature + 1e-9), dim=-1)
+    y_soft = F.softmax((logits + gumbel) / (temperature + 1e-9), dim=-1)
+
+    if hard:
+        # Straight-through estimator
+        index = y_soft.max(dim=-1, keepdim=True)[1]
+        y_hard = torch.zeros_like(y_soft).scatter_(-1, index, 1.0)
+        return y_hard - y_soft.detach() + y_soft  # 前向=one-hot, 反向=soft梯度
+    return y_soft
+
 
 def compute_recon_loglik(dec, z, y, K, use_bce=True):
     """对每个类 k 计算 log p(y|x=k, z, θ)，返回 [B, K]"""
@@ -194,11 +211,9 @@ def compute_recon_loglik(dec, z, y, K, use_bce=True):
         x_recon = dec(z, y_onehot)
         recon_images.append(x_recon)
         if use_bce:
-            # BCE: log Bernoulli(y; f_θ(k,z))
             log_p = -F.binary_cross_entropy(x_recon, y, reduction='none') \
                      .view(B, -1).sum(dim=1)
         else:
-            # MSE (Gaussian): -0.5 * ||y - f_θ(k,z)||²
             log_p = -F.mse_loss(x_recon, y, reduction='none') \
                      .view(B, -1).sum(dim=1)
         recon_loglik.append(log_p)
@@ -251,7 +266,6 @@ class TrainingLogger:
             self.records[k].append(kwargs.get(k, None))
 
     def save(self, path):
-        # numpy arrays -> list for JSON
         out = {}
         for k, v in self.records.items():
             out[k] = [x.tolist() if isinstance(x, np.ndarray) else x for x in v]

@@ -2,26 +2,15 @@
 # ═══════════════════════════════════════════════════════════════
 # Mixture VAE — 严格对齐论文 Section 2.2 的 Partially Variational EM
 #
+# ★★ v2 修改 (修复 x-collapse):
+#   1. 前 hard_gumbel_epochs 个 epoch 使用 hard Gumbel (straight-through)
+#      → 打破初始对称性, 迫使 decoder 为不同 x 产生不同输出
+#   2. logit_mix_alpha: 后验 logits 混入少量 non-detached 梯度
+#      → 让 "使不同类重建差异更大" 的信号传到 decoder
+#   3. latent_dim=2, beta_init=5.0 → 更强 z 瓶颈
+#
 # 支持两种模式:  --mode unsup     (纯无监督)
 #               --mode semisup   (半监督)
-#
-# 用法:
-#   python mVAE_aligned.py --mode unsup   --epochs 60
-#   python mVAE_aligned.py --mode semisup --epochs 60 --labeled_per_class 100
-#   python mVAE_aligned.py --optuna        (先调参再训练)
-#
-# 论文公式 (Section 2.2.1):
-#   -J^(t) = -log p(y|x,z,θ) - log p(x|Π) + KL(q(z|y)||p(z))
-#            + log p(x|z,y,θ^(t),Π^(t))
-#
-# 修正要点 (相对于原代码):
-#   1. 重建 loss: 对 log p(y|x=k,z) 加权求和 (而非对图像混合后算 MSE)
-#   2. 加入 prior 项: -Σ_k resp_k · log π_k
-#   3. 加入 posterior correction 项: +Σ_k resp_k · log p(x=k|z,y,θ^(t))
-#   4. Π 作为可学习参数 (nn.Parameter) 通过梯度更新
-#   5. 后验计算使用 detached 参数 (近似 θ^(t))
-#   6. 使用 BCE (Bernoulli) 更接近论文的 Cat
-#   7. 不需要额外的 entropy 正则 (③④合并后自然防坍缩)
 # ═══════════════════════════════════════════════════════════════
 
 import os, sys, json, argparse, time
@@ -46,7 +35,7 @@ from mVAE_common import (
 )
 
 # ============================================================
-# Model: mVAE (Paper-Aligned)
+# Model: mVAE (Paper-Aligned, v2 — x-collapse fix)
 # ============================================================
 class mVAE(nn.Module):
     """
@@ -63,12 +52,10 @@ class mVAE(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.enc = Encoder(cfg.latent_dim)
-        # ★ 选择 decoder 类型
         if getattr(cfg, 'decoder_type', 'concat') == 'film':
             self.dec = FiLMDecoder(cfg.latent_dim, cfg.num_classes, cfg.hidden_dim)
         else:
             self.dec = ConditionalDecoder(cfg.latent_dim, cfg.num_classes, cfg.hidden_dim)
-        # Π 作为可学习参数 (通过 softmax 归一化)
         self.log_pi = nn.Parameter(torch.zeros(cfg.num_classes))
         self.K = cfg.num_classes
 
@@ -79,14 +66,11 @@ class mVAE(nn.Module):
     def forward_labeled(self, y, x_true, cfg):
         """
         有标签数据: x 已知, 标准 conditional VAE loss
-
-        loss = -E_q[log p(y|x,z,θ)] + β·KL(q(z|y)||p(z)) - log π_x
         """
         mu, logvar = self.enc(y)
         z = reparameterize(mu, logvar)
         B = y.size(0)
 
-        # 重建
         x_onehot = F.one_hot(x_true, self.K).float()
         y_recon = self.dec(z, x_onehot)
 
@@ -95,10 +79,8 @@ class mVAE(nn.Module):
         else:
             recon_loss = F.mse_loss(y_recon, y, reduction='sum') / B
 
-        # KL
         kl_z = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
 
-        # Prior: -log π_{x_true}
         log_pi = torch.log(self.pi + 1e-9)
         prior_loss = -log_pi[x_true].mean()
 
@@ -109,35 +91,43 @@ class mVAE(nn.Module):
             'resp_ent': 0.0, 'mu': mu.detach()
         }
 
-    def forward_unlabeled(self, y, cfg):
+    def forward_unlabeled(self, y, cfg, epoch=None):
         """
         无标签数据: x 需要推断, 使用 partially variational EM
 
-        论文公式:
-        -J^(t) = -Σ_k x_k log p(y|k,z,θ)     [① 加权重建]
-                 -Σ_k x_k log π_k              [② 先验]
-                 + KL(q(z|y)||p(z))             [③ KL散度]
-                 +Σ_k x_k log p(x=k|z,y,θ^(t)) [④ 后验校正]
-
-        其中 x 通过 Gumbel softmax 从后验 p(x|z,y,θ^(t)) 采样
+        ★★ v2 修改:
+          1. logits 使用 mixed: (1-α)*detached + α*live
+             → 少量梯度从 resp 流到 decoder, 信号="让不同类重建更不同"
+          2. hard Gumbel 前 N epochs → 每样本明确分配到一个类
         """
         mu, logvar = self.enc(y)
         z = reparameterize(mu, logvar)
         B = y.size(0)
 
         # === 计算每个类的 log p(y|x=k, z, θ) ===
-        # 这里需要梯度 (用于 M-step 更新 θ)
         recon_loglik, _ = compute_recon_loglik(
             self.dec, z, y, self.K, cfg.use_bce)  # [B, K]
 
         # === E-step: 计算后验 p(x|z,y,θ^(t),Π^(t)) ===
-        # 使用 detached 值, 近似 θ^(t)
         log_pi = torch.log(self.pi + 1e-9)                       # [K]
-        logits = log_pi.unsqueeze(0) + recon_loglik.detach()      # [B, K], detached!
-        log_posterior = F.log_softmax(logits, dim=1)              # log p(x=k|z,y,θ^(t))
 
-        # Gumbel softmax 采样 x
-        resp = gumbel_softmax_sample(logits, cfg.current_gumbel_temp)  # [B, K]
+        # ★★ v2 核心修改: 混合 logits
+        # 论文要求 detach (近似 θ^(t)), 但纯 detach 导致 x-collapse
+        # 混入少量 non-detached 梯度, 让 decoder 收到 "区分不同类" 的信号
+        alpha = getattr(cfg, 'logit_mix_alpha', 0.0)
+        logits_detached = log_pi.unsqueeze(0) + recon_loglik.detach()
+        if alpha > 0:
+            logits_live = log_pi.unsqueeze(0) + recon_loglik
+            logits = (1 - alpha) * logits_detached + alpha * logits_live
+        else:
+            logits = logits_detached
+
+        log_posterior = F.log_softmax(logits_detached, dim=1)     # 后验校正项始终用纯 detached
+
+        # ★★ v2: 前 N epochs 用 hard Gumbel (straight-through)
+        hard_epochs = getattr(cfg, 'hard_gumbel_epochs', 0)
+        use_hard = (epoch is not None and epoch <= hard_epochs)
+        resp = gumbel_softmax_sample(logits, cfg.current_gumbel_temp, hard=use_hard)
 
         # === 计算论文的 -J^(t) 各项 ===
 
@@ -151,10 +141,9 @@ class mVAE(nn.Module):
         kl_z = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
 
         # ④ 后验校正: +Σ_k x_k · log p(x=k|z,y,θ^(t))
-        # 注意: log_posterior 是 detached 的, 梯度只通过 resp 传
         posterior_corr = (resp * log_posterior).sum(dim=1).mean()
 
-        # 总 loss = -J^(t) 的 Monte Carlo 估计
+        # 总 loss
         loss = weighted_recon + cfg.beta * kl_z + prior_loss + posterior_corr
 
         # 诊断指标
@@ -220,7 +209,8 @@ def evaluate_model(model, loader, cfg):
 
     for y_img, y_label in loader:
         y_img = y_img.to(cfg.device)
-        loss, info = model.forward_unlabeled(y_img, cfg)
+        # ★ 评估时不用 hard Gumbel, 传 epoch=999
+        loss, info = model.forward_unlabeled(y_img, cfg, epoch=999)
         total_loss += loss.item()
         n_batches += 1
 
@@ -243,25 +233,13 @@ def evaluate_model(model, loader, cfg):
 
 
 # ============================================================
-# Diagnostic: x-conditionality score (修正版)
+# Diagnostic: x-conditionality score
 # ============================================================
 @torch.no_grad()
 def measure_x_conditionality(model, loader, cfg, n_z=50):
-    """
-    测量 decoder 对 x 的依赖程度 (ANOVA 风格分解)。
-
-    方法: 取真实图像编码的 z, 对每个 z 用所有 K 个 x 解码,
-    然后计算:
-        Var_x = 固定 z 时, 改变 x 引起的方差 (平均)
-        Var_z = 固定 x 时, 改变 z 引起的方差 (平均)
-        xcond = Var_x / (Var_x + Var_z)
-
-    返回 0~1: 0=完全忽略x, 0.5=x和z同等重要, 1=只依赖x
-    """
     model.eval()
     K = cfg.num_classes
 
-    # ★ 用真实图像编码的 z (不是随机 z!)
     zs = []
     for y_img, _ in loader:
         y_img = y_img.to(cfg.device)
@@ -269,28 +247,22 @@ def measure_x_conditionality(model, loader, cfg, n_z=50):
         zs.append(mu)
         if sum(z.size(0) for z in zs) >= n_z:
             break
-    z = torch.cat(zs)[:n_z]  # [n_z, latent_dim]
+    z = torch.cat(zs)[:n_z]
 
-    # 对每个 z, 用所有 K 个 x 解码
-    outputs = []  # 将是 [K, n_z, C, H, W]
+    outputs = []
     for k in range(K):
         y_onehot = F.one_hot(
             torch.full((n_z,), k, device=cfg.device, dtype=torch.long), K).float()
         out = model.dec(z, y_onehot)
         outputs.append(out)
-    outputs = torch.stack(outputs, dim=0)  # [K, n_z, C, H, W]
+    outputs = torch.stack(outputs, dim=0)
 
-    # 展平像素维度: [K, n_z, D]
     D = outputs[0].numel() // n_z
     flat = outputs.reshape(K, n_z, D)
 
-    # Var_x: 固定 z, x 变化的方差, 然后对 z 和 D 取平均
-    var_x = flat.var(dim=0).mean().item()   # var over K, mean over n_z, D
+    var_x = flat.var(dim=0).mean().item()
+    var_z = flat.var(dim=1).mean().item()
 
-    # Var_z: 固定 x, z 变化的方差, 然后对 x 和 D 取平均
-    var_z = flat.var(dim=1).mean().item()   # var over n_z, mean over K, D
-
-    # ANOVA 比例
     total = var_x + var_z + 1e-9
     score = var_x / total
 
@@ -312,8 +284,7 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
         ep_recon, ep_kl, ep_prior, ep_post, ep_ent = 0, 0, 0, 0, 0
         n_batches = 0
 
-        # ★★ 逆向 β 退火: 从 beta_init(高) 线性降到 beta_target(低)
-        # 原理: 先高β压缩z → 强迫x被使用 → 再降β让z学习类内变化
+        # ★★ 逆向 β 退火
         beta_init = getattr(cfg, 'beta_init', beta_target)
         if is_final and epoch <= cfg.kl_anneal_epochs:
             progress = epoch / cfg.kl_anneal_epochs
@@ -321,14 +292,19 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
         else:
             cfg.beta = beta_target
 
-        # ★ Tau annealing: 从 epoch 1 就开始退火!
+        # ★ Tau annealing
         cfg.current_gumbel_temp = max(
             cfg.min_gumbel_temp,
             cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
 
+        # ★★ v2: 打印 hard Gumbel 状态
+        hard_epochs = getattr(cfg, 'hard_gumbel_epochs', 0)
+        is_hard = (epoch <= hard_epochs)
+
         for y_img, _ in train_loader:
             y_img = y_img.to(cfg.device)
-            loss, info = model.forward_unlabeled(y_img, cfg)
+            # ★★ v2: 传入 epoch 以控制 hard Gumbel
+            loss, info = model.forward_unlabeled(y_img, cfg, epoch=epoch)
 
             optimizer.zero_grad()
             loss.backward()
@@ -345,7 +321,6 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
         # Evaluate
         nmi, post_acc, val_loss = evaluate_model(model, val_loader, cfg)
 
-        # ★ 用 post_acc 选 best model (而非 NMI — NMI 高不代表 x 被使用)
         if post_acc > best_acc:
             best_acc = post_acc
             if is_final:
@@ -355,7 +330,6 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
 
         pi_np = model.pi.detach().cpu().numpy()
 
-        # ★ 诊断: x-conditionality score (decoder 对不同 x 的差异有多大)
         x_cond = 0.0
         if is_final and epoch % 5 == 0:
             x_cond = measure_x_conditionality(model, val_loader, cfg)
@@ -377,9 +351,11 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
 
         if is_final:
             cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
+            hard_str = " [HARD]" if is_hard else ""
             print(f"  Ep {epoch:3d}/{total_epochs} | NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep_recon/n_batches:.1f} KL={ep_kl/n_batches:.2f} "
-                  f"β={cfg.beta:.2f} τ={cfg.current_gumbel_temp:.3f}{cond_str}")
+                  f"β={cfg.beta:.2f} τ={cfg.current_gumbel_temp:.3f}"
+                  f"{cond_str}{hard_str}")
 
     cfg.beta = beta_target
     return best_nmi
@@ -400,7 +376,6 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
         ep_recon, ep_kl, ep_prior, ep_post, ep_ent = 0, 0, 0, 0, 0
         n_batches = 0
 
-        # ★★ 逆向 β 退火 (同 unsup)
         beta_init = getattr(cfg, 'beta_init', beta_target)
         if is_final and epoch <= cfg.kl_anneal_epochs:
             progress = epoch / cfg.kl_anneal_epochs
@@ -408,10 +383,12 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
         else:
             cfg.beta = beta_target
 
-        # ★ Tau annealing: 从 epoch 1 就开始! (不再延迟)
         cfg.current_gumbel_temp = max(
             cfg.min_gumbel_temp,
             cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
+
+        hard_epochs = getattr(cfg, 'hard_gumbel_epochs', 0)
+        is_hard = (epoch <= hard_epochs)
 
         for (x_lab, y_lab), (x_un, _) in zip(labeled_loader, unlabeled_loader):
             x_lab = x_lab.to(cfg.device)
@@ -419,7 +396,8 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
             x_un = x_un.to(cfg.device)
 
             loss_lab, info_lab = model.forward_labeled(x_lab, y_lab, cfg)
-            loss_un, info_un = model.forward_unlabeled(x_un, cfg)
+            # ★★ v2: 传入 epoch
+            loss_un, info_un = model.forward_unlabeled(x_un, cfg, epoch=epoch)
 
             loss = loss_lab + cfg.alpha_unlabeled * loss_un
 
@@ -435,10 +413,8 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
             ep_ent += info_un['resp_ent']
             n_batches += 1
 
-        # Evaluate
         nmi, post_acc, val_loss = evaluate_model(model, val_loader, cfg)
 
-        # ★ 用 post_acc 选 best model
         if post_acc > best_acc:
             best_acc = post_acc
             if is_final:
@@ -448,7 +424,6 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
 
         pi_np = model.pi.detach().cpu().numpy()
 
-        # ★ 诊断: x-conditionality
         x_cond = 0.0
         if is_final and epoch % 5 == 0:
             x_cond = measure_x_conditionality(model, val_loader, cfg)
@@ -470,18 +445,19 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
 
         if is_final:
             cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
+            hard_str = " [HARD]" if is_hard else ""
             print(f"  Ep {epoch:3d}/{total_epochs} | NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep_recon/n_batches:.1f} KL={ep_kl/n_batches:.2f} "
-                  f"β={cfg.beta:.2f} τ={cfg.current_gumbel_temp:.3f}{cond_str}")
+                  f"β={cfg.beta:.2f} τ={cfg.current_gumbel_temp:.3f}"
+                  f"{cond_str}{hard_str}")
 
     cfg.beta = beta_target
     return best_nmi
 
 
 # ============================================================
-# Visualization System (16 张图)
+# Visualization System (16 张图) — 与原版完全相同
 # ============================================================
-# ---- 全局样式 ----
 COLORS = ['#2c73d2', '#ff6b6b', '#51cf66', '#ffa94d', '#845ef7',
           '#f06595', '#20c997', '#fab005', '#339af0', '#ff8787']
 
@@ -496,17 +472,13 @@ _setup_style()
 
 
 def fig01_training_curves(logger, save_path, mode="unsup"):
-    """4-panel: Loss / Recon+KL / NMI+Acc / τ+β"""
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     epochs = logger.records['epoch']
-    n = len(epochs)
 
-    # Panel 1: Total loss
     ax = axes[0, 0]
     ax.plot(epochs, logger.records['loss'], color=COLORS[0], linewidth=1.5)
     ax.set_title("Validation Loss"); ax.set_xlabel("Epoch"); ax.grid(alpha=0.3)
 
-    # Panel 2: Recon + KL + Prior + PostCorr
     ax = axes[0, 1]
     ax.plot(epochs, logger.records['recon_loss'], label='Recon', color=COLORS[0])
     ax.plot(epochs, logger.records['kl_loss'], label='KL', color=COLORS[1])
@@ -516,7 +488,6 @@ def fig01_training_curves(logger, save_path, mode="unsup"):
         ax.plot(epochs, logger.records['posterior_corr'], label='PostCorr', color=COLORS[3])
     ax.legend(fontsize=9); ax.set_title("Loss Components"); ax.grid(alpha=0.3)
 
-    # Panel 3: NMI + Acc
     ax = axes[1, 0]
     ax.plot(epochs, logger.records['nmi'], label='NMI', color=COLORS[0], linewidth=2)
     ax.plot(epochs, logger.records['posterior_acc'], label='Post.Acc', color=COLORS[1],
@@ -524,7 +495,6 @@ def fig01_training_curves(logger, save_path, mode="unsup"):
     ax.legend(fontsize=10); ax.set_title("Clustering Quality")
     ax.set_xlabel("Epoch"); ax.set_ylim(-0.05, 1.05); ax.grid(alpha=0.3)
 
-    # Panel 4: τ + β
     ax = axes[1, 1]
     ax.plot(epochs, logger.records['tau'], label='τ (Gumbel)', color=COLORS[4])
     ax2 = ax.twinx()
@@ -536,14 +506,11 @@ def fig01_training_curves(logger, save_path, mode="unsup"):
     ax.set_title("Schedule: τ & β"); ax.grid(alpha=0.3)
 
     fig.suptitle(f"mVAE Training ({mode})", fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
+    plt.tight_layout(); plt.savefig(save_path); plt.close()
     print(f"  ✓ fig01_training_curves → {save_path}")
 
 
 def fig02_nmi_acc_detail(logger, save_path):
-    """NMI + Acc 大图, 标注最佳值"""
     fig, ax = plt.subplots(figsize=(10, 5))
     epochs = logger.records['epoch']
     nmis = logger.records['nmi']
@@ -573,7 +540,6 @@ def fig02_nmi_acc_detail(logger, save_path):
 
 
 def fig03_resp_entropy(logger, save_path):
-    """resp entropy + π entropy"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
     epochs = logger.records['epoch']
 
@@ -590,11 +556,10 @@ def fig03_resp_entropy(logger, save_path):
 
 
 def fig04_pi_evolution(logger, save_path, K=10):
-    """π 随训练变化 (stacked area)"""
     pi_list = [v for v in logger.records['pi_values'] if v is not None]
     if not pi_list:
         return
-    pi_arr = np.array(pi_list)  # [n_epochs, K]
+    pi_arr = np.array(pi_list)
     epochs = list(range(1, len(pi_arr) + 1))
 
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -609,7 +574,6 @@ def fig04_pi_evolution(logger, save_path, K=10):
 
 
 def fig05_latent_space(model, loader, cfg, save_path, method='pca'):
-    """潜在空间散点图"""
     model.eval()
     zs, ys = [], []
     with torch.no_grad():
@@ -651,7 +615,6 @@ def fig05_latent_space(model, loader, cfg, save_path, method='pca'):
 
 
 def fig06_generated_samples(model, cfg, save_path, n_per_class=10):
-    """每类生成样本"""
     model.eval()
     z = torch.randn(n_per_class, cfg.latent_dim).to(cfg.device)
     all_samples = []
@@ -668,13 +631,12 @@ def fig06_generated_samples(model, cfg, save_path, n_per_class=10):
 
 
 def fig07_confusion_matrix(model, loader, cfg, save_path):
-    """聚类混淆矩阵"""
     model.eval()
     preds, trues = [], []
     with torch.no_grad():
         for y_img, y_label in loader:
             y_img = y_img.to(cfg.device)
-            _, info = model.forward_unlabeled(y_img, cfg)
+            _, info = model.forward_unlabeled(y_img, cfg, epoch=999)
             if 'resp' in info and info['resp'] is not None:
                 preds.append(info['resp'].argmax(dim=1).cpu().numpy())
                 trues.append(y_label.numpy())
@@ -690,13 +652,11 @@ def fig07_confusion_matrix(model, loader, cfg, save_path):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
 
-    # Raw counts
     im1 = ax1.imshow(cm, cmap='Blues')
     ax1.set_xlabel("Predicted cluster"); ax1.set_ylabel("True class")
     ax1.set_title("Confusion Matrix (Counts)")
     plt.colorbar(im1, ax=ax1, fraction=0.046)
 
-    # Row-normalized
     cm_norm = cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-9)
     im2 = ax2.imshow(cm_norm, cmap='Blues', vmin=0, vmax=1)
     ax2.set_xlabel("Predicted cluster"); ax2.set_ylabel("True class")
@@ -711,13 +671,12 @@ def fig07_confusion_matrix(model, loader, cfg, save_path):
 
 
 def fig08_cluster_distribution(model, loader, cfg, save_path):
-    """聚类分布 vs 真实分布"""
     model.eval()
     preds, trues = [], []
     with torch.no_grad():
         for y_img, y_label in loader:
             y_img = y_img.to(cfg.device)
-            _, info = model.forward_unlabeled(y_img, cfg)
+            _, info = model.forward_unlabeled(y_img, cfg, epoch=999)
             if 'resp' in info and info['resp'] is not None:
                 preds.append(info['resp'].argmax(dim=1).cpu().numpy())
                 trues.append(y_label.numpy())
@@ -745,7 +704,6 @@ def fig08_cluster_distribution(model, loader, cfg, save_path):
 
 
 def fig09_reconstruction(model, loader, cfg, save_path, n_show=8):
-    """原图 vs 重建 对比"""
     model.eval()
     with torch.no_grad():
         y_img, y_label = next(iter(loader))
@@ -753,9 +711,8 @@ def fig09_reconstruction(model, loader, cfg, save_path, n_show=8):
         y_label = y_label[:n_show]
 
         mu, logvar = model.enc(y_img)
-        z = mu  # 用 mu 而非采样
+        z = mu
 
-        # 用真实标签重建
         y_onehot = F.one_hot(y_label.to(cfg.device), cfg.num_classes).float()
         y_recon = model.dec(z, y_onehot)
 
@@ -772,7 +729,6 @@ def fig09_reconstruction(model, loader, cfg, save_path, n_show=8):
 
 
 def fig10_loss_decomposition(logger, save_path):
-    """Stacked area: 各 loss 成分比例"""
     epochs = logger.records['epoch']
     recon = np.abs(logger.records['recon_loss'])
     kl = np.abs(logger.records['kl_loss'])
@@ -790,16 +746,10 @@ def fig10_loss_decomposition(logger, save_path):
 
 
 def fig11_per_class_recon(model, loader, cfg, save_path, n_per_class=5, mode="unsup"):
-    """每个类的重建质量 (按类组织)
-
-    ★ 关键修正: 无监督下 cluster k ≠ digit k
-    使用 Hungarian 映射把真实标签转为对应的 cluster index
-    """
     model.eval()
     K = cfg.num_classes
     class_imgs = {k: [] for k in range(K)}
 
-    # 收集每类图像
     with torch.no_grad():
         for y_img, y_label in loader:
             for k in range(K):
@@ -810,15 +760,13 @@ def fig11_per_class_recon(model, loader, cfg, save_path, n_per_class=5, mode="un
             if all(len(v) >= n_per_class for v in class_imgs.values()):
                 break
 
-    # ★ 无监督模式: 计算 Hungarian 映射 (true_label → cluster_id)
     label_to_cluster = None
     if mode == "unsup":
-        # 用验证集计算映射
         all_preds, all_labels = [], []
         with torch.no_grad():
             for y_img, y_label in loader:
                 y_img = y_img.to(cfg.device)
-                _, info = model.forward_unlabeled(y_img, cfg)
+                _, info = model.forward_unlabeled(y_img, cfg, epoch=999)
                 if 'resp' in info and info['resp'] is not None:
                     all_preds.append(info['resp'].argmax(dim=1).cpu().numpy())
                     all_labels.append(y_label.numpy())
@@ -828,7 +776,6 @@ def fig11_per_class_recon(model, loader, cfg, save_path, n_per_class=5, mode="un
             all_preds = np.concatenate(all_preds)
             all_labels = np.concatenate(all_labels)
             _, mapping = compute_posterior_accuracy(all_preds, all_labels, K)
-            # mapping: cluster_id → true_label, 我们要反过来: true_label → cluster_id
             label_to_cluster = {v: k for k, v in mapping.items()}
 
     fig, axes = plt.subplots(K, n_per_class * 2, figsize=(n_per_class * 3, K * 1.3))
@@ -837,11 +784,10 @@ def fig11_per_class_recon(model, loader, cfg, save_path, n_per_class=5, mode="un
             imgs = torch.stack(class_imgs[k][:n_per_class]).to(cfg.device)
             mu, _ = model.enc(imgs)
 
-            # ★ 选择正确的 cluster index
             if label_to_cluster is not None:
-                cluster_k = label_to_cluster.get(k, k)  # 用映射后的 cluster
+                cluster_k = label_to_cluster.get(k, k)
             else:
-                cluster_k = k  # 半监督直接用真实标签
+                cluster_k = k
 
             y_onehot = F.one_hot(
                 torch.full((len(imgs),), cluster_k, device=cfg.device, dtype=torch.long), K).float()
@@ -863,16 +809,14 @@ def fig11_per_class_recon(model, loader, cfg, save_path, n_per_class=5, mode="un
 
 
 def fig12_gumbel_resp_heatmap(model, loader, cfg, save_path, n_samples=50):
-    """Gumbel softmax resp 热力图"""
     model.eval()
     with torch.no_grad():
         y_img, y_label = next(iter(loader))
         y_img = y_img[:n_samples].to(cfg.device)
         y_label = y_label[:n_samples]
-        _, info = model.forward_unlabeled(y_img, cfg)
-        resp = info['resp'].cpu().numpy()  # [n_samples, K]
+        _, info = model.forward_unlabeled(y_img, cfg, epoch=999)
+        resp = info['resp'].cpu().numpy()
 
-    # 按真实标签排序
     sort_idx = np.argsort(y_label.numpy())
     resp_sorted = resp[sort_idx]
     labels_sorted = y_label.numpy()[sort_idx]
@@ -883,7 +827,6 @@ def fig12_gumbel_resp_heatmap(model, loader, cfg, save_path, n_samples=50):
     ax.set_title("Gumbel Softmax Responsibilities")
     plt.colorbar(im, ax=ax, fraction=0.046, label="resp_k")
 
-    # 标记类别边界
     prev = labels_sorted[0]
     for i, label in enumerate(labels_sorted):
         if label != prev:
@@ -895,7 +838,6 @@ def fig12_gumbel_resp_heatmap(model, loader, cfg, save_path, n_samples=50):
 
 
 def fig13_interpolation(model, cfg, save_path, n_steps=10):
-    """两类之间的 z 空间插值"""
     model.eval()
     K = cfg.num_classes
     n_pairs = min(5, K // 2)
@@ -923,7 +865,6 @@ def fig13_interpolation(model, cfg, save_path, n_steps=10):
 
 
 def fig14_summary_table(logger, cfg, save_path, mode="unsup"):
-    """训练总结表"""
     nmis = logger.records['nmi']
     accs = logger.records['posterior_acc']
     best_nmi = max(nmis)
@@ -959,27 +900,19 @@ def fig14_summary_table(logger, cfg, save_path, mode="unsup"):
 
 
 def fig15_x_conditionality(model, loader, cfg, save_path, n_z=5):
-    """
-    ★ 关键诊断图: 固定 z, 改变 x → 观察生成图是否变化
-    如果每列(同一z)下所有行(不同x)看起来一样 → x 被忽略了(坍缩)
-    如果每列不同行有明显差异 → x 被正确使用
-
-    ★ 使用真实编码的 z (不是随机 z)
-    """
     model.eval()
     K = cfg.num_classes
 
-    # 取真实图像编码的 z
     with torch.no_grad():
         y_img, _ = next(iter(loader))
         y_img = y_img[:n_z].to(cfg.device)
         mu, _ = model.enc(y_img)
-        z_real = mu  # [n_z, latent_dim]
+        z_real = mu
 
     fig, axes = plt.subplots(K, n_z, figsize=(n_z * 1.5, K * 1.3))
     with torch.no_grad():
         for j in range(n_z):
-            z = z_real[j:j+1]  # [1, latent_dim]
+            z = z_real[j:j+1]
             for k in range(K):
                 y_onehot = F.one_hot(
                     torch.tensor([k], device=cfg.device), K).float()
@@ -1010,7 +943,6 @@ def generate_all_figures(model, logger, loader, cfg, mode="unsup"):
     print("Generating all figures...")
     print("=" * 50)
 
-    # 加载最佳模型
     best_path = os.path.join(cfg.output_dir, "best_model.pt")
     if os.path.exists(best_path):
         model.load_state_dict(torch.load(best_path, weights_only=False))
@@ -1032,10 +964,8 @@ def generate_all_figures(model, logger, loader, cfg, mode="unsup"):
     fig14_summary_table(logger, cfg, os.path.join(fig_dir, "fig14_summary_table.png"), mode)
     fig15_x_conditionality(model, loader, cfg, os.path.join(fig_dir, "fig15_x_conditionality.png"))
 
-    # 保存 logger
     logger.save(os.path.join(fig_dir, "training_log.json"))
 
-    # ★ 最终 x-conditionality 得分 (ANOVA 分解)
     xcond = measure_x_conditionality(model, loader, cfg)
     print(f"\n★ Final x-conditionality score (ANOVA): {xcond:.4f}")
     print(f"  (0=x被忽略, 0.5=x和z同等重要, 1=只依赖x)")
@@ -1057,11 +987,14 @@ def run_optuna(mode, n_trials=15):
 
     def objective(trial):
         cfg = Config()
-        cfg.latent_dim = trial.suggest_categorical("latent_dim", [2, 4, 8])  # ★ 不要 16/32
-        cfg.beta = trial.suggest_float("beta", 0.1, 2.0)  # ★ 上限从 5→2
+        cfg.latent_dim = trial.suggest_categorical("latent_dim", [2, 4])  # ★★ v2: 去掉 8
+        cfg.beta = trial.suggest_float("beta", 0.5, 2.0)
+        cfg.beta_init = trial.suggest_float("beta_init", 3.0, 10.0)      # ★★ v2: 搜索 beta_init
         cfg.lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
-        cfg.init_gumbel_temp = trial.suggest_float("init_gumbel_temp", 0.2, 0.7)  # ★ 更低范围
-        cfg.gumbel_anneal_rate = trial.suggest_float("gumbel_anneal_rate", 0.96, 0.995)  # ★ 新增
+        cfg.init_gumbel_temp = trial.suggest_float("init_gumbel_temp", 0.3, 0.7)
+        cfg.gumbel_anneal_rate = trial.suggest_float("gumbel_anneal_rate", 0.96, 0.995)
+        cfg.hard_gumbel_epochs = trial.suggest_int("hard_gumbel_epochs", 10, 30)   # ★★ v2
+        cfg.logit_mix_alpha = trial.suggest_float("logit_mix_alpha", 0.05, 0.3)    # ★★ v2
         cfg.current_gumbel_temp = cfg.init_gumbel_temp
 
         if mode == "semisup":
@@ -1090,18 +1023,20 @@ def run_optuna(mode, n_trials=15):
 # Main
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="mVAE Paper-Aligned Training")
+    parser = argparse.ArgumentParser(description="mVAE Paper-Aligned Training (v2 — x-collapse fix)")
     parser.add_argument("--mode", type=str, default="unsup", choices=["unsup", "semisup"])
     parser.add_argument("--epochs", type=int, default=80)
-    parser.add_argument("--latent_dim", type=int, default=4)
+    parser.add_argument("--latent_dim", type=int, default=2)          # ★★ v2: 4→2
     parser.add_argument("--beta", type=float, default=1.0)
+    parser.add_argument("--beta_init", type=float, default=5.0)       # ★★ v2: 3→5
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--labeled_per_class", type=int, default=100)
-    parser.add_argument("--use_mse", action="store_true", help="Use MSE instead of BCE")
-    parser.add_argument("--decoder", type=str, default="film", choices=["film", "concat"],
-                        help="Decoder type: film=FiLM conditioning, concat=concatenation")
-    parser.add_argument("--optuna", action="store_true", help="Run Optuna first")
+    parser.add_argument("--use_mse", action="store_true")
+    parser.add_argument("--decoder", type=str, default="film", choices=["film", "concat"])
+    parser.add_argument("--hard_gumbel_epochs", type=int, default=20) # ★★ v2
+    parser.add_argument("--logit_mix_alpha", type=float, default=0.1) # ★★ v2
+    parser.add_argument("--optuna", action="store_true")
     parser.add_argument("--n_trials", type=int, default=15)
     args = parser.parse_args()
 
@@ -1109,26 +1044,30 @@ def main():
     cfg.final_epochs = args.epochs
     cfg.latent_dim = args.latent_dim
     cfg.beta = args.beta
+    cfg.beta_init = args.beta_init
     cfg.lr = args.lr
     cfg.batch_size = args.batch_size
     cfg.labeled_per_class = args.labeled_per_class
     cfg.use_bce = not args.use_mse
     cfg.decoder_type = args.decoder
+    cfg.hard_gumbel_epochs = args.hard_gumbel_epochs
+    cfg.logit_mix_alpha = args.logit_mix_alpha
     cfg.output_dir = f"./mVAE_{args.mode}"
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     print("=" * 60)
-    print(f"mVAE Paper-Aligned Training")
-    print(f"  Mode:       {args.mode}")
-    print(f"  Decoder:    {cfg.decoder_type}")
-    print(f"  Latent dim: {cfg.latent_dim}")
-    print(f"  β:          {cfg.beta_init} → {cfg.beta} (reverse anneal over {cfg.kl_anneal_epochs} epochs)")
-    print(f"  Emission:   {'BCE (Bernoulli)' if cfg.use_bce else 'MSE (Gaussian)'}")
-    print(f"  Epochs:     {cfg.final_epochs}")
-    print(f"  Device:     {cfg.device}")
+    print(f"mVAE Paper-Aligned Training (v2 — x-collapse fix)")
+    print(f"  Mode:             {args.mode}")
+    print(f"  Decoder:          {cfg.decoder_type}")
+    print(f"  Latent dim:       {cfg.latent_dim}")
+    print(f"  β:                {cfg.beta_init} → {cfg.beta} (reverse anneal over {cfg.kl_anneal_epochs} epochs)")
+    print(f"  Hard Gumbel:      first {cfg.hard_gumbel_epochs} epochs")     # ★★ v2
+    print(f"  Logit mix α:      {cfg.logit_mix_alpha}")                     # ★★ v2
+    print(f"  Emission:         {'BCE (Bernoulli)' if cfg.use_bce else 'MSE (Gaussian)'}")
+    print(f"  Epochs:           {cfg.final_epochs}")
+    print(f"  Device:           {cfg.device}")
     print("=" * 60)
 
-    # --- Optuna ---
     if args.optuna:
         print("\n--- Running Optuna Hyperparameter Search ---")
         best_params = run_optuna(args.mode, args.n_trials)
@@ -1138,7 +1077,6 @@ def main():
         json.dump(best_params, open(os.path.join(cfg.output_dir, "best_params.json"), "w"), indent=2)
         print(f"Best params saved. Starting final training...\n")
 
-    # --- Final Training ---
     logger = TrainingLogger()
     model = mVAE(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
@@ -1156,10 +1094,8 @@ def main():
 
     print(f"\n✅ Training complete. Best NMI: {best_nmi:.4f}")
 
-    # --- Generate all visualizations ---
     generate_all_figures(model, logger, eval_loader, cfg, mode=args.mode)
 
-    # 保存配置
     cfg_dict = {k: v for k, v in vars(cfg).items()
                 if not k.startswith('_') and isinstance(v, (int, float, str, bool))}
     json.dump(cfg_dict, open(os.path.join(cfg.output_dir, "config.json"), "w"), indent=2)
