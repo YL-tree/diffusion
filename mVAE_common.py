@@ -19,18 +19,19 @@ from scipy.optimize import linear_sum_assignment
 # ============================================================
 class Config:
     # --- 模型 ---
-    latent_dim = 2                 # ★★ 4→2: z 只有2维,必须依赖 x
+    latent_dim = 4                 # 4维: 平衡 z 容量与 x 依赖
     hidden_dim = 256
     num_classes = 10
 
     # --- 论文公式参数 ---
-    beta = 2.0                     # ★★ 0.5→2.0: 强力压缩 z
+    beta = 1.0                     # 最终 β 目标值
+    beta_init = 3.0                # ★★ 逆向退火: 起始 β 高, 先强制 x 被使用
     use_bce = True
 
     # --- Gumbel softmax ---
-    init_gumbel_temp = 0.3         # ★★ 0.5→0.3: 从一开始就接近 one-hot
+    init_gumbel_temp = 0.3
     min_gumbel_temp = 0.05
-    gumbel_anneal_rate = 0.97      # ★★ 0.98→0.97: 更快退火
+    gumbel_anneal_rate = 0.97
     current_gumbel_temp = init_gumbel_temp
 
     # --- 半监督 ---
@@ -42,7 +43,8 @@ class Config:
     batch_size = 128
     optuna_epochs = 15
     final_epochs = 80
-    kl_anneal_epochs = 5           # ★★ 20→5: β 在 5 个 epoch 内就到位
+    kl_anneal_epochs = 15          # β 从 beta_init 退火到 beta 用 15 epoch
+    decoder_type = 'film'          # ★★ 'concat'=旧版, 'film'=FiLM条件化
 
     # --- 设备 ---
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -69,7 +71,7 @@ class Encoder(nn.Module):
 
 
 # ============================================================
-# Conditional Decoder  p(y|x,z,θ)
+# Conditional Decoder (Concatenation — 原版, 弱条件化)
 # ============================================================
 class ConditionalDecoder(nn.Module):
     def __init__(self, latent_dim=16, num_classes=10, hidden_dim=256):
@@ -86,6 +88,87 @@ class ConditionalDecoder(nn.Module):
     def forward(self, z, y_onehot):
         h = torch.cat([z, y_onehot], dim=1)
         return self.decoder(self.fc(h))
+
+
+# ============================================================
+# FiLM Decoder (★★ 强条件化 — decoder 结构性依赖 x)
+#
+# 原理: x 不是和 z 拼接, 而是通过 FiLM 层调制 z 的每一层特征
+#       h_l = γ_l(x) ⊙ h_l + β_l(x)
+# 这使得 decoder 在数学上不可能忽略 x:
+#   - 如果忽略 x, γ=1, β=0, 相当于无条件解码, 对10类输出相同
+#   - 要产生不同类的图像, 必须使用 x 来调制
+# ============================================================
+class FiLMDecoder(nn.Module):
+    def __init__(self, latent_dim=4, num_classes=10, hidden_dim=256):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_classes = num_classes
+
+        # 类嵌入: x → 中间表示
+        self.class_embed = nn.Sequential(
+            nn.Linear(num_classes, 64), nn.ReLU(), nn.Linear(64, 64))
+
+        # z 到初始特征
+        self.z_fc = nn.Linear(latent_dim, hidden_dim)
+
+        # FiLM 层 1: class → scale+shift for hidden_dim
+        self.film1_gamma = nn.Linear(64, hidden_dim)
+        self.film1_beta = nn.Linear(64, hidden_dim)
+
+        # hidden → spatial
+        self.fc2 = nn.Linear(hidden_dim, 64 * 7 * 7)
+
+        # FiLM 层 2: class → scale+shift for conv channels
+        self.film2_gamma = nn.Linear(64, 64)
+        self.film2_beta = nn.Linear(64, 64)
+
+        # 反卷积
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU(),
+        )
+
+        # FiLM 层 3: class → scale+shift for conv channels
+        self.film3_gamma = nn.Linear(64, 32)
+        self.film3_beta = nn.Linear(64, 32)
+
+        self.final_conv = nn.Sequential(
+            nn.ConvTranspose2d(32, 1, 4, 2, 1), nn.Sigmoid()
+        )
+
+    def forward(self, z, y_onehot):
+        # 类嵌入
+        c = self.class_embed(y_onehot)  # [B, 64]
+
+        # z → 初始特征
+        h = F.relu(self.z_fc(z))  # [B, hidden_dim]
+
+        # FiLM 调制 1: γ(x) ⊙ h + β(x)
+        gamma1 = self.film1_gamma(c)  # [B, hidden_dim]
+        beta1 = self.film1_beta(c)
+        h = gamma1 * h + beta1
+        h = F.relu(h)
+
+        # → spatial
+        h = F.relu(self.fc2(h))  # [B, 64*7*7]
+        h = h.view(-1, 64, 7, 7)
+
+        # FiLM 调制 2
+        gamma2 = self.film2_gamma(c).unsqueeze(-1).unsqueeze(-1)  # [B,64,1,1]
+        beta2 = self.film2_beta(c).unsqueeze(-1).unsqueeze(-1)
+        h = gamma2 * h + beta2
+        h = F.relu(h)
+
+        # 反卷积
+        h = self.deconv(h)  # [B, 32, 14, 14]
+
+        # FiLM 调制 3
+        gamma3 = self.film3_gamma(c).unsqueeze(-1).unsqueeze(-1)  # [B,32,1,1]
+        beta3 = self.film3_beta(c).unsqueeze(-1).unsqueeze(-1)
+        h = gamma3 * h + beta3
+        h = F.relu(h)
+
+        return self.final_conv(h)  # [B, 1, 28, 28]
 
 
 # ============================================================

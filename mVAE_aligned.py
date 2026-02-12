@@ -40,7 +40,7 @@ from sklearn.cluster import KMeans
 from scipy.optimize import linear_sum_assignment
 
 from mVAE_common import (
-    Config, Encoder, ConditionalDecoder,
+    Config, Encoder, ConditionalDecoder, FiLMDecoder,
     reparameterize, gumbel_softmax_sample, compute_recon_loglik,
     compute_NMI, compute_posterior_accuracy, TrainingLogger
 )
@@ -63,7 +63,11 @@ class mVAE(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.enc = Encoder(cfg.latent_dim)
-        self.dec = ConditionalDecoder(cfg.latent_dim, cfg.num_classes, cfg.hidden_dim)
+        # ★ 选择 decoder 类型
+        if getattr(cfg, 'decoder_type', 'concat') == 'film':
+            self.dec = FiLMDecoder(cfg.latent_dim, cfg.num_classes, cfg.hidden_dim)
+        else:
+            self.dec = ConditionalDecoder(cfg.latent_dim, cfg.num_classes, cfg.hidden_dim)
         # Π 作为可学习参数 (通过 softmax 归一化)
         self.log_pi = nn.Parameter(torch.zeros(cfg.num_classes))
         self.K = cfg.num_classes
@@ -289,13 +293,16 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
         ep_recon, ep_kl, ep_prior, ep_post, ep_ent = 0, 0, 0, 0, 0
         n_batches = 0
 
-        # Beta annealing (线性 warmup)
+        # ★★ 逆向 β 退火: 从 beta_init(高) 线性降到 beta_target(低)
+        # 原理: 先高β压缩z → 强迫x被使用 → 再降β让z学习类内变化
+        beta_init = getattr(cfg, 'beta_init', beta_target)
         if is_final and epoch <= cfg.kl_anneal_epochs:
-            cfg.beta = beta_target * (epoch / cfg.kl_anneal_epochs)
+            progress = epoch / cfg.kl_anneal_epochs
+            cfg.beta = beta_init + (beta_target - beta_init) * progress
         else:
             cfg.beta = beta_target
 
-        # ★ Tau annealing: 从 epoch 1 就开始退火! (不再延迟)
+        # ★ Tau annealing: 从 epoch 1 就开始退火!
         cfg.current_gumbel_temp = max(
             cfg.min_gumbel_temp,
             cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
@@ -374,9 +381,11 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
         ep_recon, ep_kl, ep_prior, ep_post, ep_ent = 0, 0, 0, 0, 0
         n_batches = 0
 
-        # Beta annealing (线性 warmup)
+        # ★★ 逆向 β 退火 (同 unsup)
+        beta_init = getattr(cfg, 'beta_init', beta_target)
         if is_final and epoch <= cfg.kl_anneal_epochs:
-            cfg.beta = beta_target * (epoch / cfg.kl_anneal_epochs)
+            progress = epoch / cfg.kl_anneal_epochs
+            cfg.beta = beta_init + (beta_target - beta_init) * progress
         else:
             cfg.beta = beta_target
 
@@ -1015,12 +1024,14 @@ def main():
     parser = argparse.ArgumentParser(description="mVAE Paper-Aligned Training")
     parser.add_argument("--mode", type=str, default="unsup", choices=["unsup", "semisup"])
     parser.add_argument("--epochs", type=int, default=80)
-    parser.add_argument("--latent_dim", type=int, default=2)
-    parser.add_argument("--beta", type=float, default=2.0)
+    parser.add_argument("--latent_dim", type=int, default=4)
+    parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--labeled_per_class", type=int, default=100)
     parser.add_argument("--use_mse", action="store_true", help="Use MSE instead of BCE")
+    parser.add_argument("--decoder", type=str, default="film", choices=["film", "concat"],
+                        help="Decoder type: film=FiLM conditioning, concat=concatenation")
     parser.add_argument("--optuna", action="store_true", help="Run Optuna first")
     parser.add_argument("--n_trials", type=int, default=15)
     args = parser.parse_args()
@@ -1033,14 +1044,16 @@ def main():
     cfg.batch_size = args.batch_size
     cfg.labeled_per_class = args.labeled_per_class
     cfg.use_bce = not args.use_mse
+    cfg.decoder_type = args.decoder
     cfg.output_dir = f"./mVAE_{args.mode}"
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     print("=" * 60)
     print(f"mVAE Paper-Aligned Training")
     print(f"  Mode:       {args.mode}")
+    print(f"  Decoder:    {cfg.decoder_type}")
     print(f"  Latent dim: {cfg.latent_dim}")
-    print(f"  β:          {cfg.beta}")
+    print(f"  β:          {cfg.beta_init} → {cfg.beta} (reverse anneal over {cfg.kl_anneal_epochs} epochs)")
     print(f"  Emission:   {'BCE (Bernoulli)' if cfg.use_bce else 'MSE (Gaussian)'}")
     print(f"  Epochs:     {cfg.final_epochs}")
     print(f"  Device:     {cfg.device}")
