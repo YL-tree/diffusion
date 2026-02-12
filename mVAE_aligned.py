@@ -1,20 +1,10 @@
 # mVAE_aligned.py
 # ═══════════════════════════════════════════════════════════════
-# Mixture VAE — v4: 严格论文公式, 从 epoch 1 开始, 不分阶段
-#
-# 论文公式 (Section 2.2):
-#   -J^(t) = -Σ_k x_k log p(y|k,z,θ)     ① 加权重建
-#            -Σ_k x_k log π_k              ② 先验
-#            + KL(q(z|y)||p(z))             ③ KL
-#            +Σ_k x_k log p(x=k|z,y,θ^(t)) ④ 后验校正
-#
-# 其中 x 通过 Gumbel softmax 从 p(x|z,y,θ^(t),Π^(t)) 采样
-#
-# ★★ 添加两个正则化 (不改变 ELBO 结构):
-#   1. z_dropout: 训练时对 z 做 dropout, 迫使 decoder 不能只靠 z
-#      理论依据: 等价于 p(z) 的噪声注入, 信息瓶颈正则化
-#   2. balance_loss: Σ_k q̄_k log q̄_k (q̄ = batch 平均软分配)
-#      理论依据: 等价于 Π 的 Dirichlet(1,...,1) 先验, 鼓励均匀使用所有类
+# Mixture VAE — v4.1
+#   论文 Section 2.2 的完整公式, 从 epoch 1 开始, 不分阶段
+#   + z_dropout (decoder 正则化)
+#   + balance_loss (可选, --balance_weight 0 关闭)
+#   + ★ 修复: semi-supervised 中 labeled loader 循环复用
 # ═══════════════════════════════════════════════════════════════
 
 import os, sys, json, argparse, time
@@ -59,18 +49,11 @@ class mVAE(nn.Module):
         return F.softmax(self.log_pi, dim=0)
 
     def forward_unlabeled(self, y, cfg):
-        """
-        论文 Section 2.2 的完整公式, 从 epoch 1 开始使用。
-
-        唯一的两个额外正则化:
-          - z_dropout: z 在进入 decoder 前被 dropout
-          - balance_loss: 防止类坍缩
-        """
+        """论文 Section 2.2 完整公式 + z_dropout + 可选 balance loss"""
         mu, logvar = self.enc(y)
         z_clean = reparameterize(mu, logvar)
 
-        # ★★ z_dropout: 训练时随机丢弃 z 的维度
-        # 迫使 decoder 不能仅靠 z 重建, 必须使用 x
+        # z_dropout: 迫使 decoder 依赖 x
         if self.training and self.z_dropout_rate > 0:
             z = F.dropout(z_clean, p=self.z_dropout_rate, training=True)
         else:
@@ -78,39 +61,33 @@ class mVAE(nn.Module):
 
         B = y.size(0)
 
-        # 每个类的 log p(y|x=k, z, θ) — z 已经 dropout 过
-        recon_loglik, _ = compute_recon_loglik(
-            self.dec, z, y, self.K, cfg.use_bce)  # [B, K]
+        # 每个类的 log p(y|x=k, z, θ)
+        recon_loglik, _ = compute_recon_loglik(self.dec, z, y, self.K, cfg.use_bce)
 
-        # E-step: 后验 p(x|z,y,θ^(t),Π^(t)) — 用 detached 参数
+        # E-step: 后验 (detached)
         log_pi = torch.log(self.pi + 1e-9)
-        logits = log_pi.unsqueeze(0) + recon_loglik.detach()     # [B, K]
+        logits = log_pi.unsqueeze(0) + recon_loglik.detach()
         log_posterior = F.log_softmax(logits, dim=1)
 
-        # Gumbel softmax 采样 x
-        resp = gumbel_softmax_sample(logits, cfg.current_gumbel_temp)  # [B, K]
+        # Gumbel softmax 采样
+        resp = gumbel_softmax_sample(logits, cfg.current_gumbel_temp)
 
-        # ① 加权重建: -Σ_k x_k · log p(y|k,z,θ)
+        # 论文 -J^(t) 四项
         weighted_recon = -(resp * recon_loglik).sum(dim=1).mean()
-
-        # ② 先验: -Σ_k x_k · log π_k
         prior_loss = -(resp * log_pi.unsqueeze(0)).sum(dim=1).mean()
-
-        # ③ KL(q(z|y) || p(z))
         kl_z = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
-
-        # ④ 后验校正: +Σ_k x_k · log p(x=k|z,y,θ^(t))
         posterior_corr = (resp * log_posterior).sum(dim=1).mean()
 
-        # 论文 ELBO
         loss = weighted_recon + cfg.beta * kl_z + prior_loss + posterior_corr
 
-        # ★★ Balance loss (正则化, 非 ELBO 的一部分)
-        # 防止所有样本被分到少数几个类
-        soft_assign = F.softmax(recon_loglik.detach(), dim=1)    # [B, K]
-        q_bar = soft_assign.mean(dim=0)                          # [K]
-        balance_loss = torch.sum(q_bar * torch.log(q_bar + 1e-9))  # 负熵
-        loss = loss + cfg.balance_weight * balance_loss
+        # 可选 balance loss (--balance_weight 0 可关闭)
+        balance = 0.0
+        if cfg.balance_weight > 0:
+            soft_assign = F.softmax(recon_loglik.detach(), dim=1)
+            q_bar = soft_assign.mean(dim=0)
+            balance_loss = torch.sum(q_bar * torch.log(q_bar + 1e-9))
+            loss = loss + cfg.balance_weight * balance_loss
+            balance = balance_loss.item()
 
         resp_entropy = -(resp * torch.log(resp + 1e-9)).sum(dim=1).mean()
 
@@ -118,7 +95,7 @@ class mVAE(nn.Module):
             'recon': weighted_recon.item(), 'kl': kl_z.item(),
             'prior': prior_loss.item(), 'post_corr': posterior_corr.item(),
             'resp_ent': resp_entropy.item(), 'mu': mu.detach(),
-            'resp': resp.detach(), 'balance': balance_loss.item(),
+            'resp': resp.detach(), 'balance': balance,
         }
 
     def forward_labeled(self, y, x_true, cfg):
@@ -229,7 +206,7 @@ def measure_x_conditionality(model, loader, cfg, n_z=50):
 
 
 # ============================================================
-# Training: Unsupervised (单阶段, 论文公式)
+# Training: Unsupervised
 # ============================================================
 def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
                        logger=None, is_final=False):
@@ -241,7 +218,6 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
         ep = {'recon': 0, 'kl': 0, 'prior': 0, 'post': 0, 'ent': 0, 'bal': 0}
         n_batches = 0
 
-        # τ 退火
         cfg.current_gumbel_temp = max(
             cfg.min_gumbel_temp,
             cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
@@ -287,17 +263,18 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
 
         if is_final:
             cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
+            bal_str = f" Bal={ep['bal']/n_batches:.3f}" if cfg.balance_weight > 0 else ""
             print(f"  Ep {epoch:3d}/{total_epochs} "
                   f"| NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep['recon']/n_batches:.1f} KL={ep['kl']/n_batches:.2f} "
-                  f"Bal={ep['bal']/n_batches:.3f} "
-                  f"τ={cfg.current_gumbel_temp:.3f}{cond_str}")
+                  f"τ={cfg.current_gumbel_temp:.3f}{bal_str}{cond_str}")
 
     return best_nmi
 
 
 # ============================================================
 # Training: Semi-supervised
+# ★★ 修复: labeled loader 循环复用, 不再被 zip 截断
 # ============================================================
 def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
                          val_loader, cfg, logger=None, is_final=False):
@@ -313,7 +290,17 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
             cfg.min_gumbel_temp,
             cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
 
-        for (x_lab, y_lab), (x_un, _) in zip(labeled_loader, unlabeled_loader):
+        # ★★ 修复: 遍历全部 unlabeled 数据, labeled 循环复用
+        labeled_iter = iter(labeled_loader)
+
+        for x_un, _ in unlabeled_loader:
+            # labeled 用完就重新开始
+            try:
+                x_lab, y_lab = next(labeled_iter)
+            except StopIteration:
+                labeled_iter = iter(labeled_loader)
+                x_lab, y_lab = next(labeled_iter)
+
             x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device)
             x_un = x_un.to(cfg.device)
 
@@ -342,6 +329,10 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
         best_nmi = max(best_nmi, nmi)
 
         pi_np = model.pi.detach().cpu().numpy()
+        x_cond = 0.0
+        if is_final and epoch % 10 == 0:
+            x_cond = measure_x_conditionality(model, val_loader, cfg)
+
         if logger:
             logger.log(
                 epoch=epoch, phase="SemiSup",
@@ -354,10 +345,14 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
                 pi_entropy=float(-(pi_np * np.log(pi_np + 1e-9)).sum()),
                 pi_values=pi_np, balance_loss=ep['bal']/n_batches,
             )
+
         if is_final:
+            cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
+            bal_str = f" Bal={ep['bal']/n_batches:.3f}" if cfg.balance_weight > 0 else ""
             print(f"  Ep {epoch:3d}/{total_epochs} "
                   f"| NMI={nmi:.4f} Acc={post_acc:.4f} "
-                  f"| R={ep['recon']/n_batches:.1f} KL={ep['kl']/n_batches:.2f}")
+                  f"| R={ep['recon']/n_batches:.1f} KL={ep['kl']/n_batches:.2f} "
+                  f"τ={cfg.current_gumbel_temp:.3f}{bal_str}{cond_str}")
 
     return best_nmi
 
@@ -505,7 +500,7 @@ def generate_all_figures(model, logger, loader, cfg, mode="unsup"):
 # Main
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="mVAE v4")
+    parser = argparse.ArgumentParser(description="mVAE v4.1")
     parser.add_argument("--mode", default="unsup", choices=["unsup", "semisup"])
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--latent_dim", type=int, default=2)
@@ -518,6 +513,7 @@ def main():
     parser.add_argument("--tau_start", type=float, default=1.0)
     parser.add_argument("--tau_min", type=float, default=0.1)
     parser.add_argument("--tau_rate", type=float, default=0.98)
+    parser.add_argument("--alpha_unlabeled", type=float, default=0.5)
     parser.add_argument("--labeled_per_class", type=int, default=100)
     args = parser.parse_args()
 
@@ -534,12 +530,13 @@ def main():
     cfg.min_gumbel_temp = args.tau_min
     cfg.gumbel_anneal_rate = args.tau_rate
     cfg.current_gumbel_temp = cfg.init_gumbel_temp
+    cfg.alpha_unlabeled = args.alpha_unlabeled
     cfg.labeled_per_class = args.labeled_per_class
     cfg.output_dir = f"./mVAE_{args.mode}"
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     print("=" * 60)
-    print(f"mVAE v4 — Paper formula + z_dropout + balance_loss")
+    print(f"mVAE v4.1 — Paper formula + z_dropout + balance_loss")
     print(f"  Mode:          {args.mode}")
     print(f"  Decoder:       {cfg.decoder_type}")
     print(f"  Latent dim:    {cfg.latent_dim}")
@@ -547,6 +544,9 @@ def main():
     print(f"  z_dropout:     {cfg.z_dropout_rate}")
     print(f"  balance_w:     {cfg.balance_weight}")
     print(f"  τ:             {cfg.init_gumbel_temp} → {cfg.min_gumbel_temp} (rate={cfg.gumbel_anneal_rate})")
+    if args.mode == "semisup":
+        print(f"  α_unlabeled:   {cfg.alpha_unlabeled}")
+        print(f"  labeled/class: {cfg.labeled_per_class}")
     print(f"  Epochs:        {cfg.final_epochs}")
     print(f"  Device:        {cfg.device}")
     print("=" * 60)
