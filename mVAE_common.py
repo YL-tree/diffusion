@@ -1,8 +1,10 @@
 # mVAE_common.py
-# 公共组件：网络结构、工具函数
-# ★★ v3: 借鉴 HMM-VAE 的成功策略
+# ★★ v4: 论文公式从 epoch 1 开始, 不分阶段
+#   添加两个正则化 (不改变 ELBO 结构):
+#     1. z_dropout: decoder 正则化, 迫使 decoder 依赖 x
+#     2. balance_loss: 等价于 Π 的 Dirichlet 先验, 防止类坍缩
 
-import os, json, time
+import os, json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,48 +21,40 @@ from scipy.optimize import linear_sum_assignment
 # Config
 # ============================================================
 class Config:
-    # --- 模型 ---
     latent_dim = 2
     hidden_dim = 256
     num_classes = 10
 
-    # --- 论文公式参数 ---
-    beta = 2.0                     # Phase 2 最终 β
+    beta = 2.0
     use_bce = True
 
-    # --- Gumbel softmax ---
-    init_gumbel_temp = 2.0         # ★★ v3: 跟 HMM-VAE 一致
+    # Gumbel
+    init_gumbel_temp = 1.0
     min_gumbel_temp = 0.1
     gumbel_anneal_rate = 0.98
     current_gumbel_temp = init_gumbel_temp
 
-    # --- ★★ v3: 两阶段训练 (借鉴 HMM-VAE) ---
-    pretrain_epochs = 30           # Phase 1: emission bootstrap
-    pretrain_beta = 50.0           # Phase 1 的 KL 权重 (压制 z)
-    z_dropout_rate = 0.7           # Phase 1 的 z dropout
-    balance_weight = 50.0          # 防止类坍缩
-    pretrain_lr = 1e-3             # Phase 1 学习率
-    finetune_lr = 1e-4             # Phase 2 学习率 (VAE 部分)
-    pi_lr = 1e-2                   # Phase 2 Π 学习率
+    # ★★ v4: 两个正则化 (论文框架兼容)
+    z_dropout_rate = 0.5           # decoder 侧 z dropout
+    balance_weight = 10.0          # balance loss 权重
 
-    # --- 半监督 ---
-    alpha_unlabeled = 0.5
-    labeled_per_class = 100
-
-    # --- 训练 ---
+    # 训练
     lr = 1e-3
     batch_size = 128
     optuna_epochs = 15
     final_epochs = 100
     decoder_type = 'film'
 
-    # --- 设备 ---
+    # 半监督
+    alpha_unlabeled = 0.5
+    labeled_per_class = 100
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     output_dir = "./mVAE_results"
 
 
 # ============================================================
-# Encoder  q_ϕ(z|y) = N(z; μ_ϕ(y), σ²_ϕ(y)I)
+# Encoder
 # ============================================================
 class Encoder(nn.Module):
     def __init__(self, latent_dim=16):
@@ -99,54 +93,37 @@ class ConditionalDecoder(nn.Module):
 
 
 # ============================================================
-# FiLM Decoder (强条件化)
+# FiLM Decoder
 # ============================================================
 class FiLMDecoder(nn.Module):
     def __init__(self, latent_dim=4, num_classes=10, hidden_dim=256):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.num_classes = num_classes
-
         self.class_embed = nn.Sequential(
             nn.Linear(num_classes, 64), nn.ReLU(), nn.Linear(64, 64))
         self.z_fc = nn.Linear(latent_dim, hidden_dim)
-
         self.film1_gamma = nn.Linear(64, hidden_dim)
         self.film1_beta = nn.Linear(64, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 64 * 7 * 7)
         self.film2_gamma = nn.Linear(64, 64)
         self.film2_beta = nn.Linear(64, 64)
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU())
+        self.deconv = nn.Sequential(nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU())
         self.film3_gamma = nn.Linear(64, 32)
         self.film3_beta = nn.Linear(64, 32)
-        self.final_conv = nn.Sequential(
-            nn.ConvTranspose2d(32, 1, 4, 2, 1), nn.Sigmoid())
+        self.final_conv = nn.Sequential(nn.ConvTranspose2d(32, 1, 4, 2, 1), nn.Sigmoid())
 
     def forward(self, z, y_onehot):
         c = self.class_embed(y_onehot)
         h = F.relu(self.z_fc(z))
-
-        gamma1 = self.film1_gamma(c)
-        beta1 = self.film1_beta(c)
-        h = gamma1 * h + beta1
+        h = self.film1_gamma(c) * h + self.film1_beta(c)
         h = F.relu(h)
-
-        h = F.relu(self.fc2(h))
-        h = h.view(-1, 64, 7, 7)
-
-        gamma2 = self.film2_gamma(c).unsqueeze(-1).unsqueeze(-1)
-        beta2 = self.film2_beta(c).unsqueeze(-1).unsqueeze(-1)
-        h = gamma2 * h + beta2
-        h = F.relu(h)
-
+        h = F.relu(self.fc2(h)).view(-1, 64, 7, 7)
+        g2 = self.film2_gamma(c).unsqueeze(-1).unsqueeze(-1)
+        b2 = self.film2_beta(c).unsqueeze(-1).unsqueeze(-1)
+        h = F.relu(g2 * h + b2)
         h = self.deconv(h)
-
-        gamma3 = self.film3_gamma(c).unsqueeze(-1).unsqueeze(-1)
-        beta3 = self.film3_beta(c).unsqueeze(-1).unsqueeze(-1)
-        h = gamma3 * h + beta3
-        h = F.relu(h)
-
+        g3 = self.film3_gamma(c).unsqueeze(-1).unsqueeze(-1)
+        b3 = self.film3_beta(c).unsqueeze(-1).unsqueeze(-1)
+        h = F.relu(g3 * h + b3)
         return self.final_conv(h)
 
 
@@ -183,10 +160,7 @@ def compute_recon_loglik(dec, z, y, K, use_bce=True):
             log_p = -F.mse_loss(x_recon, y, reduction='none') \
                      .view(B, -1).sum(dim=1)
         recon_loglik.append(log_p)
-    recon_loglik = torch.stack(recon_loglik, dim=1)
-    recon_images = torch.stack(recon_images, dim=1)
-    return recon_loglik, recon_images
-
+    return torch.stack(recon_loglik, dim=1), torch.stack(recon_images, dim=1)
 
 def compute_NMI(Z, Y, n_clusters=10):
     try:
@@ -196,7 +170,6 @@ def compute_NMI(Z, Y, n_clusters=10):
         return float(NMI(Y, km.fit_predict(Z)))
     except:
         return 0.0
-
 
 def compute_posterior_accuracy(preds, true_labels, K):
     cost = np.zeros((K, K))
@@ -228,7 +201,3 @@ class TrainingLogger:
             out[k] = [x.tolist() if isinstance(x, np.ndarray) else x for x in v]
         with open(path, 'w') as f:
             json.dump(out, f, indent=2)
-
-    def load(self, path):
-        with open(path) as f:
-            self.records = json.load(f)
