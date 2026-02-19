@@ -25,6 +25,7 @@ from scipy.optimize import linear_sum_assignment
 from mVAE_common import (
     Config, Encoder, ConditionalDecoder, FiLMDecoder,
     reparameterize, gumbel_softmax_sample, compute_recon_loglik,
+    compute_diversity_loss,
     compute_NMI, compute_posterior_accuracy, TrainingLogger
 )
 
@@ -49,7 +50,7 @@ class mVAE(nn.Module):
         return F.softmax(self.log_pi, dim=0)
 
     def forward_unlabeled(self, y, cfg):
-        """论文 Section 2.2 完整公式 + z_dropout + 可选 balance loss"""
+        """论文 Section 2.2 完整公式 + z_dropout + balance + diversity"""
         mu, logvar = self.enc(y)
         z_clean = reparameterize(mu, logvar)
 
@@ -62,7 +63,7 @@ class mVAE(nn.Module):
         B = y.size(0)
 
         # 每个类的 log p(y|x=k, z, θ)
-        recon_loglik, _ = compute_recon_loglik(self.dec, z, y, self.K, cfg.use_bce)
+        recon_loglik, recon_images = compute_recon_loglik(self.dec, z, y, self.K, cfg.use_bce)
 
         # E-step: 后验 (detached)
         log_pi = torch.log(self.pi + 1e-9)
@@ -89,6 +90,13 @@ class mVAE(nn.Module):
             loss = loss + cfg.balance_weight * balance_loss
             balance = balance_loss.item()
 
+        # ★★ v4.2: diversity loss — 防止 mode duplication
+        diversity = 0.0
+        if getattr(cfg, 'diversity_weight', 0) > 0:
+            div_loss = compute_diversity_loss(recon_images)
+            loss = loss + cfg.diversity_weight * div_loss
+            diversity = div_loss.item()
+
         resp_entropy = -(resp * torch.log(resp + 1e-9)).sum(dim=1).mean()
 
         return loss, {
@@ -96,6 +104,7 @@ class mVAE(nn.Module):
             'prior': prior_loss.item(), 'post_corr': posterior_corr.item(),
             'resp_ent': resp_entropy.item(), 'mu': mu.detach(),
             'resp': resp.detach(), 'balance': balance,
+            'diversity': diversity,
         }
 
     def forward_labeled(self, y, x_true, cfg):
@@ -215,7 +224,7 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
 
     for epoch in range(1, total_epochs + 1):
         model.train()
-        ep = {'recon': 0, 'kl': 0, 'prior': 0, 'post': 0, 'ent': 0, 'bal': 0}
+        ep = {'recon': 0, 'kl': 0, 'prior': 0, 'post': 0, 'ent': 0, 'bal': 0, 'div': 0}
         n_batches = 0
 
         cfg.current_gumbel_temp = max(
@@ -234,6 +243,7 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
             ep['recon'] += info['recon']; ep['kl'] += info['kl']
             ep['prior'] += info['prior']; ep['post'] += info['post_corr']
             ep['ent'] += info['resp_ent']; ep['bal'] += info['balance']
+            ep['div'] += info.get('diversity', 0)
             n_batches += 1
 
         nmi, post_acc, val_loss = evaluate_model(model, val_loader, cfg)
@@ -259,15 +269,17 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
                 resp_entropy=ep['ent']/n_batches,
                 pi_entropy=float(-(pi_np * np.log(pi_np + 1e-9)).sum()),
                 pi_values=pi_np, balance_loss=ep['bal']/n_batches,
+                diversity_loss=ep['div']/n_batches,
             )
 
         if is_final:
             cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
             bal_str = f" Bal={ep['bal']/n_batches:.3f}" if cfg.balance_weight > 0 else ""
+            div_str = f" Div={ep['div']/n_batches:.3f}" if getattr(cfg, 'diversity_weight', 0) > 0 else ""
             print(f"  Ep {epoch:3d}/{total_epochs} "
                   f"| NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep['recon']/n_batches:.1f} KL={ep['kl']/n_batches:.2f} "
-                  f"τ={cfg.current_gumbel_temp:.3f}{bal_str}{cond_str}")
+                  f"τ={cfg.current_gumbel_temp:.3f}{bal_str}{div_str}{cond_str}")
 
     return best_nmi
 
@@ -283,7 +295,7 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
 
     for epoch in range(1, total_epochs + 1):
         model.train()
-        ep = {'recon': 0, 'kl': 0, 'prior': 0, 'post': 0, 'ent': 0, 'bal': 0}
+        ep = {'recon': 0, 'kl': 0, 'prior': 0, 'post': 0, 'ent': 0, 'bal': 0, 'div': 0}
         n_batches = 0
 
         cfg.current_gumbel_temp = max(
@@ -319,6 +331,7 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
             ep['post'] += info_un['post_corr']
             ep['ent'] += info_un['resp_ent']
             ep['bal'] += info_un['balance']
+            ep['div'] += info_un.get('diversity', 0)
             n_batches += 1
 
         nmi, post_acc, val_loss = evaluate_model(model, val_loader, cfg)
@@ -344,15 +357,17 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
                 resp_entropy=ep['ent']/n_batches,
                 pi_entropy=float(-(pi_np * np.log(pi_np + 1e-9)).sum()),
                 pi_values=pi_np, balance_loss=ep['bal']/n_batches,
+                diversity_loss=ep['div']/n_batches,
             )
 
         if is_final:
             cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
             bal_str = f" Bal={ep['bal']/n_batches:.3f}" if cfg.balance_weight > 0 else ""
+            div_str = f" Div={ep['div']/n_batches:.3f}" if getattr(cfg, 'diversity_weight', 0) > 0 else ""
             print(f"  Ep {epoch:3d}/{total_epochs} "
                   f"| NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep['recon']/n_batches:.1f} KL={ep['kl']/n_batches:.2f} "
-                  f"τ={cfg.current_gumbel_temp:.3f}{bal_str}{cond_str}")
+                  f"τ={cfg.current_gumbel_temp:.3f}{bal_str}{div_str}{cond_str}")
 
     return best_nmi
 
@@ -507,6 +522,7 @@ def main():
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument("--z_dropout", type=float, default=0.5)
     parser.add_argument("--balance_weight", type=float, default=10.0)
+    parser.add_argument("--diversity_weight", type=float, default=2.0)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--decoder", default="film", choices=["film", "concat"])
@@ -523,6 +539,7 @@ def main():
     cfg.beta = args.beta
     cfg.z_dropout_rate = args.z_dropout
     cfg.balance_weight = args.balance_weight
+    cfg.diversity_weight = args.diversity_weight
     cfg.lr = args.lr
     cfg.batch_size = args.batch_size
     cfg.decoder_type = args.decoder
@@ -536,13 +553,14 @@ def main():
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     print("=" * 60)
-    print(f"mVAE v4.1 — Paper formula + z_dropout + balance_loss")
+    print(f"mVAE v4.2 — Paper formula + z_dropout + balance + diversity")
     print(f"  Mode:          {args.mode}")
     print(f"  Decoder:       {cfg.decoder_type}")
     print(f"  Latent dim:    {cfg.latent_dim}")
     print(f"  β:             {cfg.beta}")
     print(f"  z_dropout:     {cfg.z_dropout_rate}")
     print(f"  balance_w:     {cfg.balance_weight}")
+    print(f"  diversity_w:   {cfg.diversity_weight}")
     print(f"  τ:             {cfg.init_gumbel_temp} → {cfg.min_gumbel_temp} (rate={cfg.gumbel_anneal_rate})")
     if args.mode == "semisup":
         print(f"  α_unlabeled:   {cfg.alpha_unlabeled}")

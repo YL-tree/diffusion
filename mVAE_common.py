@@ -38,6 +38,9 @@ class Config:
     z_dropout_rate = 0.5           # decoder 侧 z dropout
     balance_weight = 10.0          # balance loss 权重
 
+    # ★★ v4.2: diversity loss — 防止 mode duplication
+    diversity_weight = 2.0         # diversity loss 权重 (0 关闭)
+
     # 训练
     lr = 1e-3
     batch_size = 128
@@ -162,6 +165,23 @@ def compute_recon_loglik(dec, z, y, K, use_bce=True):
         recon_loglik.append(log_p)
     return torch.stack(recon_loglik, dim=1), torch.stack(recon_images, dim=1)
 
+
+def compute_diversity_loss(recon_images):
+    """
+    ★ Diversity loss: 惩罚不同 cluster 对同一 z 产出过于相似的重建,
+       防止多个 cluster 坍缩到同一个 digit (mode duplication).
+
+       recon_images: (B, K, 1, 28, 28)  — compute_recon_loglik 的第二个返回值
+       返回: scalar, 值越大表示 cluster 之间越相似 (应被最小化)
+    """
+    B, K = recon_images.shape[:2]
+    flat = recon_images.view(B, K, -1)                     # (B, K, D)
+    flat_norm = F.normalize(flat, dim=-1)                   # L2 归一化
+    sim = torch.bmm(flat_norm, flat_norm.transpose(1, 2))   # (B, K, K)
+    # 只取严格上三角 (排除对角线上的 self-similarity)
+    mask = torch.triu(torch.ones(K, K, device=sim.device), diagonal=1).bool()
+    return sim[:, mask].mean()
+
 def compute_NMI(Z, Y, n_clusters=10):
     try:
         if len(Z) < n_clusters:
@@ -186,7 +206,7 @@ class TrainingLogger:
     KEYS = ["epoch", "phase", "loss", "recon_loss", "kl_loss",
             "prior_loss", "posterior_corr", "beta", "tau",
             "nmi", "posterior_acc", "resp_entropy",
-            "pi_entropy", "pi_values", "balance_loss"]
+            "pi_entropy", "pi_values", "balance_loss", "diversity_loss"]
 
     def __init__(self):
         self.records = {k: [] for k in self.KEYS}
