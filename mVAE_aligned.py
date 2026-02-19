@@ -25,7 +25,6 @@ from scipy.optimize import linear_sum_assignment
 from mVAE_common import (
     Config, Encoder, ConditionalDecoder, FiLMDecoder,
     reparameterize, gumbel_softmax_sample, compute_recon_loglik,
-    compute_diversity_loss,
     compute_NMI, compute_posterior_accuracy, TrainingLogger
 )
 
@@ -50,7 +49,7 @@ class mVAE(nn.Module):
         return F.softmax(self.log_pi, dim=0)
 
     def forward_unlabeled(self, y, cfg):
-        """论文 Section 2.2 完整公式 + z_dropout + balance + diversity"""
+        """论文 Section 2.2 完整公式 + z_dropout + 可选 balance loss"""
         mu, logvar = self.enc(y)
         z_clean = reparameterize(mu, logvar)
 
@@ -63,7 +62,7 @@ class mVAE(nn.Module):
         B = y.size(0)
 
         # 每个类的 log p(y|x=k, z, θ)
-        recon_loglik, recon_images = compute_recon_loglik(self.dec, z, y, self.K, cfg.use_bce)
+        recon_loglik, _ = compute_recon_loglik(self.dec, z, y, self.K, cfg.use_bce)
 
         # E-step: 后验 (detached)
         log_pi = torch.log(self.pi + 1e-9)
@@ -81,7 +80,7 @@ class mVAE(nn.Module):
 
         loss = weighted_recon + cfg.beta * kl_z + prior_loss + posterior_corr
 
-        # 可选 balance loss
+        # 可选 balance loss (--balance_weight 0 可关闭)
         balance = 0.0
         if cfg.balance_weight > 0:
             soft_assign = F.softmax(recon_loglik.detach(), dim=1)
@@ -90,13 +89,6 @@ class mVAE(nn.Module):
             loss = loss + cfg.balance_weight * balance_loss
             balance = balance_loss.item()
 
-        # ★★ v4.2: 残差 diversity loss — 防止 mode duplication
-        diversity = 0.0
-        if getattr(cfg, 'diversity_weight', 0) > 0:
-            div_loss = compute_diversity_loss(recon_images)
-            loss = loss + cfg.diversity_weight * div_loss
-            diversity = div_loss.item()
-
         resp_entropy = -(resp * torch.log(resp + 1e-9)).sum(dim=1).mean()
 
         return loss, {
@@ -104,7 +96,6 @@ class mVAE(nn.Module):
             'prior': prior_loss.item(), 'post_corr': posterior_corr.item(),
             'resp_ent': resp_entropy.item(), 'mu': mu.detach(),
             'resp': resp.detach(), 'balance': balance,
-            'diversity': diversity,
         }
 
     def forward_labeled(self, y, x_true, cfg):
@@ -184,11 +175,13 @@ def evaluate_model(model, loader, cfg):
         if info.get('resp') is not None:
             preds.append(info['resp'].argmax(dim=1).cpu().numpy())
     zs = np.concatenate(zs); ys_true = np.concatenate(ys_true)
-    nmi = compute_NMI(zs, ys_true, cfg.num_classes)
+    # NMI 始终用 10 个 KMeans cluster (与真实 10 类对比)
+    nmi = compute_NMI(zs, ys_true, 10)
     post_acc = 0.0
     if preds:
         preds = np.concatenate(preds)
-        post_acc, _ = compute_posterior_accuracy(preds, ys_true, cfg.num_classes)
+        post_acc, _ = compute_posterior_accuracy(preds, ys_true,
+                                                  cfg.num_classes, num_true=10)
     return nmi, post_acc, total_loss / max(n, 1)
 
 
@@ -224,7 +217,7 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
 
     for epoch in range(1, total_epochs + 1):
         model.train()
-        ep = {'recon': 0, 'kl': 0, 'prior': 0, 'post': 0, 'ent': 0, 'bal': 0, 'div': 0}
+        ep = {'recon': 0, 'kl': 0, 'prior': 0, 'post': 0, 'ent': 0, 'bal': 0}
         n_batches = 0
 
         cfg.current_gumbel_temp = max(
@@ -243,7 +236,6 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
             ep['recon'] += info['recon']; ep['kl'] += info['kl']
             ep['prior'] += info['prior']; ep['post'] += info['post_corr']
             ep['ent'] += info['resp_ent']; ep['bal'] += info['balance']
-            ep['div'] += info.get('diversity', 0)
             n_batches += 1
 
         nmi, post_acc, val_loss = evaluate_model(model, val_loader, cfg)
@@ -269,17 +261,15 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
                 resp_entropy=ep['ent']/n_batches,
                 pi_entropy=float(-(pi_np * np.log(pi_np + 1e-9)).sum()),
                 pi_values=pi_np, balance_loss=ep['bal']/n_batches,
-                diversity_loss=ep['div']/n_batches,
             )
 
         if is_final:
             cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
             bal_str = f" Bal={ep['bal']/n_batches:.3f}" if cfg.balance_weight > 0 else ""
-            div_str = f" Div={ep['div']/n_batches:.4f}" if getattr(cfg, 'diversity_weight', 0) > 0 else ""
             print(f"  Ep {epoch:3d}/{total_epochs} "
                   f"| NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep['recon']/n_batches:.1f} KL={ep['kl']/n_batches:.2f} "
-                  f"τ={cfg.current_gumbel_temp:.3f}{bal_str}{div_str}{cond_str}")
+                  f"τ={cfg.current_gumbel_temp:.3f}{bal_str}{cond_str}")
 
     return best_nmi
 
@@ -295,7 +285,7 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
 
     for epoch in range(1, total_epochs + 1):
         model.train()
-        ep = {'recon': 0, 'kl': 0, 'prior': 0, 'post': 0, 'ent': 0, 'bal': 0, 'div': 0}
+        ep = {'recon': 0, 'kl': 0, 'prior': 0, 'post': 0, 'ent': 0, 'bal': 0}
         n_batches = 0
 
         cfg.current_gumbel_temp = max(
@@ -331,7 +321,6 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
             ep['post'] += info_un['post_corr']
             ep['ent'] += info_un['resp_ent']
             ep['bal'] += info_un['balance']
-            ep['div'] += info_un.get('diversity', 0)
             n_batches += 1
 
         nmi, post_acc, val_loss = evaluate_model(model, val_loader, cfg)
@@ -357,17 +346,15 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
                 resp_entropy=ep['ent']/n_batches,
                 pi_entropy=float(-(pi_np * np.log(pi_np + 1e-9)).sum()),
                 pi_values=pi_np, balance_loss=ep['bal']/n_batches,
-                diversity_loss=ep['div']/n_batches,
             )
 
         if is_final:
             cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
             bal_str = f" Bal={ep['bal']/n_batches:.3f}" if cfg.balance_weight > 0 else ""
-            div_str = f" Div={ep['div']/n_batches:.4f}" if getattr(cfg, 'diversity_weight', 0) > 0 else ""
             print(f"  Ep {epoch:3d}/{total_epochs} "
                   f"| NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep['recon']/n_batches:.1f} KL={ep['kl']/n_batches:.2f} "
-                  f"τ={cfg.current_gumbel_temp:.3f}{bal_str}{div_str}{cond_str}")
+                  f"τ={cfg.current_gumbel_temp:.3f}{bal_str}{cond_str}")
 
     return best_nmi
 
@@ -429,10 +416,11 @@ def fig06_generated_samples(model, cfg, save_path, n_per_class=10):
 def fig11_per_class_recon(model, loader, cfg, save_path, n_per_class=5, mode="unsup"):
     model.eval()
     K = cfg.num_classes
-    class_imgs = {k: [] for k in range(K)}
+    num_digits = 10  # MNIST 真实类别数
+    class_imgs = {k: [] for k in range(num_digits)}
     with torch.no_grad():
         for y_img, y_label in loader:
-            for k in range(K):
+            for k in range(num_digits):
                 mask = y_label == k
                 if mask.sum() > 0 and len(class_imgs[k]) < n_per_class:
                     class_imgs[k].extend(y_img[mask][:n_per_class - len(class_imgs[k])])
@@ -449,13 +437,27 @@ def fig11_per_class_recon(model, loader, cfg, save_path, n_per_class=5, mode="un
                     all_labels.append(y_label.numpy())
                 if sum(p.shape[0] for p in all_preds) > 2000: break
         if all_preds:
+            all_preds_cat = np.concatenate(all_preds)
+            all_labels_cat = np.concatenate(all_labels)
             _, mapping = compute_posterior_accuracy(
-                np.concatenate(all_preds), np.concatenate(all_labels), K)
-            label_to_cluster = {v: k for k, v in mapping.items()}
+                all_preds_cat, all_labels_cat, K, num_true=num_digits)
+            # 反转: digit -> 最佳 cluster (选该 digit 中样本最多的 cluster)
+            from collections import Counter
+            label_to_cluster = {}
+            for digit in range(num_digits):
+                # 找到所有映射到此 digit 的 cluster
+                clusters_for_digit = [c for c, d in mapping.items() if d == digit]
+                if clusters_for_digit:
+                    # 选样本数最多的 cluster
+                    best = max(clusters_for_digit,
+                               key=lambda c: np.sum(all_preds_cat == c))
+                    label_to_cluster[digit] = best
+                else:
+                    label_to_cluster[digit] = digit  # fallback
 
-    fig, axes = plt.subplots(K, n_per_class*2, figsize=(n_per_class*3, K*1.3))
+    fig, axes = plt.subplots(num_digits, n_per_class*2, figsize=(n_per_class*3, num_digits*1.3))
     with torch.no_grad():
-        for k in range(K):
+        for k in range(num_digits):
             imgs = torch.stack(class_imgs[k][:n_per_class]).to(cfg.device)
             mu, _ = model.enc(imgs)
             ck = label_to_cluster.get(k, k) if label_to_cluster else k
@@ -518,11 +520,13 @@ def main():
     parser = argparse.ArgumentParser(description="mVAE v4.1")
     parser.add_argument("--mode", default="unsup", choices=["unsup", "semisup"])
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--K", type=int, default=10,
+                        help="Number of mixture components (clusters). "
+                             "Use K>10 for over-clustering, then auto-merge.")
     parser.add_argument("--latent_dim", type=int, default=2)
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument("--z_dropout", type=float, default=0.5)
     parser.add_argument("--balance_weight", type=float, default=10.0)
-    parser.add_argument("--diversity_weight", type=float, default=5.0)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--decoder", default="film", choices=["film", "concat"])
@@ -534,12 +538,12 @@ def main():
     args = parser.parse_args()
 
     cfg = Config()
+    cfg.num_classes = args.K
     cfg.final_epochs = args.epochs
     cfg.latent_dim = args.latent_dim
     cfg.beta = args.beta
     cfg.z_dropout_rate = args.z_dropout
     cfg.balance_weight = args.balance_weight
-    cfg.diversity_weight = args.diversity_weight
     cfg.lr = args.lr
     cfg.batch_size = args.batch_size
     cfg.decoder_type = args.decoder
@@ -553,14 +557,14 @@ def main():
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     print("=" * 60)
-    print(f"mVAE v4.2 — Paper formula + z_dropout + balance + diversity")
+    print(f"mVAE v4.3 — Over-clustering support (K≥10)")
     print(f"  Mode:          {args.mode}")
+    print(f"  K (clusters):  {cfg.num_classes}  {'(over-clustering → auto merge)' if cfg.num_classes > 10 else ''}")
     print(f"  Decoder:       {cfg.decoder_type}")
     print(f"  Latent dim:    {cfg.latent_dim}")
     print(f"  β:             {cfg.beta}")
     print(f"  z_dropout:     {cfg.z_dropout_rate}")
     print(f"  balance_w:     {cfg.balance_weight}")
-    print(f"  diversity_w:   {cfg.diversity_weight}")
     print(f"  τ:             {cfg.init_gumbel_temp} → {cfg.min_gumbel_temp} (rate={cfg.gumbel_anneal_rate})")
     if args.mode == "semisup":
         print(f"  α_unlabeled:   {cfg.alpha_unlabeled}")

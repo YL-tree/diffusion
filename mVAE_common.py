@@ -38,9 +38,6 @@ class Config:
     z_dropout_rate = 0.5           # decoder 侧 z dropout
     balance_weight = 10.0          # balance loss 权重
 
-    # ★★ v4.2: 残差 diversity loss — 防止 mode duplication
-    diversity_weight = 5.0         # diversity loss 权重 (0 关闭)
-
     # 训练
     lr = 1e-3
     batch_size = 128
@@ -165,34 +162,6 @@ def compute_recon_loglik(dec, z, y, K, use_bce=True):
         recon_loglik.append(log_p)
     return torch.stack(recon_loglik, dim=1), torch.stack(recon_images, dim=1)
 
-
-def compute_diversity_loss(recon_images):
-    """
-    ★ 残差 diversity loss: 防止多个 cluster 坍缩到同一 digit (mode duplication).
-
-    关键改进: 先减去 batch 内所有 cluster 的均值, 去掉共享的黑色背景结构,
-    只在"各 cluster 特有的笔画差异"上计算 cosine similarity.
-    这样, 两个都生成 "1" 的 cluster 残差几乎相同 (高 sim → 被惩罚),
-    而生成 "1" 和 "0" 的 cluster 残差方向完全不同 (低 sim → 不被惩罚).
-
-    recon_images: (B, K, 1, 28, 28) — compute_recon_loglik 的第二个返回值
-    返回: scalar, 越大表示 cluster 输出越雷同 (应被最小化)
-    """
-    B, K = recon_images.shape[:2]
-    flat = recon_images.view(B, K, -1)                      # (B, K, D)
-
-    # 减去 batch 内 K 个 cluster 的均值 → 残差 = 每个 cluster 的"独特贡献"
-    mean_all = flat.mean(dim=1, keepdim=True)                # (B, 1, D)
-    residuals = flat - mean_all                               # (B, K, D)
-
-    # 对残差做 L2 归一化后计算 cosine similarity
-    res_norm = F.normalize(residuals, dim=-1)                 # (B, K, D)
-    sim = torch.bmm(res_norm, res_norm.transpose(1, 2))      # (B, K, K)
-
-    # 只取严格上三角 (排除对角线自相似)
-    mask = torch.triu(torch.ones(K, K, device=sim.device), diagonal=1).bool()
-    return sim[:, mask].mean()
-
 def compute_NMI(Z, Y, n_clusters=10):
     try:
         if len(Z) < n_clusters:
@@ -202,13 +171,31 @@ def compute_NMI(Z, Y, n_clusters=10):
     except:
         return 0.0
 
-def compute_posterior_accuracy(preds, true_labels, K):
-    cost = np.zeros((K, K))
-    for i in range(K):
-        for j in range(K):
-            cost[i, j] = -np.sum((true_labels == i) & (preds == j))
-    row_ind, col_ind = linear_sum_assignment(cost)
-    mapping = {int(c): int(l) for c, l in zip(col_ind, row_ind)}
+def compute_posterior_accuracy(preds, true_labels, K, num_true=10):
+    """
+    K == num_true: 标准 Hungarian 匹配 (一一对应)
+    K >  num_true: 过聚类 (over-clustering), 用多数投票法,
+                   多个 cluster 可以对应同一个真实类别
+    """
+    if K <= num_true:
+        # 原始 Hungarian 方法
+        cost = np.zeros((num_true, K))
+        for i in range(num_true):
+            for j in range(K):
+                cost[i, j] = -np.sum((true_labels == i) & (preds == j))
+        row_ind, col_ind = linear_sum_assignment(cost)
+        mapping = {int(c): int(l) for c, l in zip(col_ind, row_ind)}
+    else:
+        # 多数投票: 每个 cluster 对应其内部最多的真实标签
+        mapping = {}
+        for k in range(K):
+            mask = preds == k
+            if mask.sum() > 0:
+                mapping[k] = int(np.bincount(true_labels[mask],
+                                              minlength=num_true).argmax())
+            else:
+                mapping[k] = 0
+
     aligned = np.array([mapping.get(p, 0) for p in preds])
     return np.mean(aligned == true_labels), mapping
 
@@ -217,7 +204,7 @@ class TrainingLogger:
     KEYS = ["epoch", "phase", "loss", "recon_loss", "kl_loss",
             "prior_loss", "posterior_corr", "beta", "tau",
             "nmi", "posterior_acc", "resp_entropy",
-            "pi_entropy", "pi_values", "balance_loss", "diversity_loss"]
+            "pi_entropy", "pi_values", "balance_loss"]
 
     def __init__(self):
         self.records = {k: [] for k in self.KEYS}
