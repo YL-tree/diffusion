@@ -81,7 +81,7 @@ class mVAE(nn.Module):
 
         loss = weighted_recon + cfg.beta * kl_z + prior_loss + posterior_corr
 
-        # 可选 balance loss (--balance_weight 0 可关闭)
+        # 可选 balance loss
         balance = 0.0
         if cfg.balance_weight > 0:
             soft_assign = F.softmax(recon_loglik.detach(), dim=1)
@@ -90,7 +90,7 @@ class mVAE(nn.Module):
             loss = loss + cfg.balance_weight * balance_loss
             balance = balance_loss.item()
 
-        # ★★ v4.2: diversity loss — 防止 mode duplication
+        # ★★ v4.2: 残差 diversity loss — 防止 mode duplication
         diversity = 0.0
         if getattr(cfg, 'diversity_weight', 0) > 0:
             div_loss = compute_diversity_loss(recon_images)
@@ -275,7 +275,7 @@ def train_unsupervised(model, optimizer, train_loader, val_loader, cfg,
         if is_final:
             cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
             bal_str = f" Bal={ep['bal']/n_batches:.3f}" if cfg.balance_weight > 0 else ""
-            div_str = f" Div={ep['div']/n_batches:.3f}" if getattr(cfg, 'diversity_weight', 0) > 0 else ""
+            div_str = f" Div={ep['div']/n_batches:.4f}" if getattr(cfg, 'diversity_weight', 0) > 0 else ""
             print(f"  Ep {epoch:3d}/{total_epochs} "
                   f"| NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep['recon']/n_batches:.1f} KL={ep['kl']/n_batches:.2f} "
@@ -363,7 +363,7 @@ def train_semisupervised(model, optimizer, labeled_loader, unlabeled_loader,
         if is_final:
             cond_str = f" xcond={x_cond:.3f}" if x_cond > 0 else ""
             bal_str = f" Bal={ep['bal']/n_batches:.3f}" if cfg.balance_weight > 0 else ""
-            div_str = f" Div={ep['div']/n_batches:.3f}" if getattr(cfg, 'diversity_weight', 0) > 0 else ""
+            div_str = f" Div={ep['div']/n_batches:.4f}" if getattr(cfg, 'diversity_weight', 0) > 0 else ""
             print(f"  Ep {epoch:3d}/{total_epochs} "
                   f"| NMI={nmi:.4f} Acc={post_acc:.4f} "
                   f"| R={ep['recon']/n_batches:.1f} KL={ep['kl']/n_batches:.2f} "
@@ -522,7 +522,7 @@ def main():
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument("--z_dropout", type=float, default=0.5)
     parser.add_argument("--balance_weight", type=float, default=10.0)
-    parser.add_argument("--diversity_weight", type=float, default=2.0)
+    parser.add_argument("--diversity_weight", type=float, default=5.0)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--decoder", default="film", choices=["film", "concat"])

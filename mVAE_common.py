@@ -38,8 +38,8 @@ class Config:
     z_dropout_rate = 0.5           # decoder 侧 z dropout
     balance_weight = 10.0          # balance loss 权重
 
-    # ★★ v4.2: diversity loss — 防止 mode duplication
-    diversity_weight = 2.0         # diversity loss 权重 (0 关闭)
+    # ★★ v4.2: 残差 diversity loss — 防止 mode duplication
+    diversity_weight = 5.0         # diversity loss 权重 (0 关闭)
 
     # 训练
     lr = 1e-3
@@ -168,17 +168,28 @@ def compute_recon_loglik(dec, z, y, K, use_bce=True):
 
 def compute_diversity_loss(recon_images):
     """
-    ★ Diversity loss: 惩罚不同 cluster 对同一 z 产出过于相似的重建,
-       防止多个 cluster 坍缩到同一个 digit (mode duplication).
+    ★ 残差 diversity loss: 防止多个 cluster 坍缩到同一 digit (mode duplication).
 
-       recon_images: (B, K, 1, 28, 28)  — compute_recon_loglik 的第二个返回值
-       返回: scalar, 值越大表示 cluster 之间越相似 (应被最小化)
+    关键改进: 先减去 batch 内所有 cluster 的均值, 去掉共享的黑色背景结构,
+    只在"各 cluster 特有的笔画差异"上计算 cosine similarity.
+    这样, 两个都生成 "1" 的 cluster 残差几乎相同 (高 sim → 被惩罚),
+    而生成 "1" 和 "0" 的 cluster 残差方向完全不同 (低 sim → 不被惩罚).
+
+    recon_images: (B, K, 1, 28, 28) — compute_recon_loglik 的第二个返回值
+    返回: scalar, 越大表示 cluster 输出越雷同 (应被最小化)
     """
     B, K = recon_images.shape[:2]
-    flat = recon_images.view(B, K, -1)                     # (B, K, D)
-    flat_norm = F.normalize(flat, dim=-1)                   # L2 归一化
-    sim = torch.bmm(flat_norm, flat_norm.transpose(1, 2))   # (B, K, K)
-    # 只取严格上三角 (排除对角线上的 self-similarity)
+    flat = recon_images.view(B, K, -1)                      # (B, K, D)
+
+    # 减去 batch 内 K 个 cluster 的均值 → 残差 = 每个 cluster 的"独特贡献"
+    mean_all = flat.mean(dim=1, keepdim=True)                # (B, 1, D)
+    residuals = flat - mean_all                               # (B, K, D)
+
+    # 对残差做 L2 归一化后计算 cosine similarity
+    res_norm = F.normalize(residuals, dim=-1)                 # (B, K, D)
+    sim = torch.bmm(res_norm, res_norm.transpose(1, 2))      # (B, K, K)
+
+    # 只取严格上三角 (排除对角线自相似)
     mask = torch.triu(torch.ones(K, K, device=sim.device), diagonal=1).bool()
     return sim[:, mask].mean()
 
