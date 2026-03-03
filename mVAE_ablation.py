@@ -2,24 +2,33 @@
 mVAE_ablation.py — mVAE 消融实验自动化框架 (unsup + semisup 双模式)
 ====================================================================
 
+两阶段方法论:
+  Phase 0: Optuna 搜索 → 找到最优 baseline 超参 (只跑一次)
+  Phase 1: 消融实验   → 固定 baseline, 控制变量 (×3 seeds)
+
 功能:
-  1. 定义 unsup (18) + semisup (6) 共 24 个消融配置
-  2. 自动运行全部实验 (每个配置 x 3 seeds)
-  3. 保存每次运行的指标到 JSON (支持断点续跑)
+  1. [Phase 0] Optuna 搜索 baseline (可选, --optuna)
+  2. [Phase 1] 定义 unsup (18) + semisup (6) 共 24 个消融配置
+  3. 自动运行全部实验 (每个配置 x 3 seeds, 断点续跑)
   4. 生成对比图表和 LaTeX 表格
 
 使用:
-  python mVAE_ablation.py                                 # unsup 全部
-  python mVAE_ablation.py --mode semisup                  # semisup 全部
-  python mVAE_ablation.py --mode both                     # 两者都跑
-  python mVAE_ablation.py --plot-only                     # 仅出图
-  python mVAE_ablation.py --config full_model --seed 42   # 单个配置
-  python mVAE_ablation.py --quick                         # 30 epochs
+  # Phase 0: Optuna 找 baseline (建议先跑这步)
+  python mVAE_ablation.py --optuna --mode unsup            # 100 trials
+  python mVAE_ablation.py --optuna --mode semisup --n-trials 50
 
-依赖: mVAE_aligned.py, mVAE_common.py
+  # Phase 1: 消融实验 (自动加载 Optuna 找到的 baseline)
+  python mVAE_ablation.py                                  # unsup 全部
+  python mVAE_ablation.py --mode semisup                   # semisup 全部
+  python mVAE_ablation.py --mode both                      # 两者都跑
+  python mVAE_ablation.py --plot-only                      # 仅出图
+  python mVAE_ablation.py --config full_model --seed 42    # 单个配置
+  python mVAE_ablation.py --quick                          # 30 epochs
+
+依赖: mVAE_aligned.py, mVAE_common.py, optuna (Phase 0 only)
 """
 
-import os, json, time, argparse
+import os, sys, json, time, argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -37,9 +46,167 @@ from mVAE_aligned import (
 
 
 # ==============================================================
+# Phase 0: Optuna Baseline Search
+# ==============================================================
+
+OPTUNA_SEARCH_SPACE = {
+    # 参数名:  (type, choices_or_range)
+    "latent_dim":     ("categorical", [2, 4, 8, 16]),
+    "beta":           ("categorical", [0.5, 1.0, 2.0, 4.0]),
+    "z_dropout_rate":  ("categorical", [0.0, 0.3, 0.5, 0.7]),
+    "balance_weight":  ("categorical", [0.0, 1.0, 5.0, 10.0, 20.0]),
+    "tau_min":         ("categorical", [0.05, 0.1, 0.2, 0.3]),
+    "tau_rate":        ("categorical", [0.95, 0.97, 0.98, 0.99]),
+    "lr":              ("loguniform",  [5e-4, 3e-3]),
+}
+
+# 不搜索的参数 (固定)
+OPTUNA_FIXED = dict(
+    num_classes=10, decoder_type="film", batch_size=128,
+    tau_start=1.0, epochs=15,  # 短 epochs 做快速筛选
+    alpha_unlabeled=0.5, labeled_per_class=100,
+)
+
+
+def _optuna_objective(trial, mode, loaders):
+    """Optuna 目标函数: 复合得分 = 0.6*acc + 0.2*xcond + 0.2*recon_score"""
+    params = {}
+    for name, (ptype, spec) in OPTUNA_SEARCH_SPACE.items():
+        if ptype == "categorical":
+            params[name] = trial.suggest_categorical(name, spec)
+        elif ptype == "loguniform":
+            params[name] = trial.suggest_float(name, spec[0], spec[1], log=True)
+
+    cfg_dict = {**OPTUNA_FIXED, **params, "name": "optuna_trial",
+                "display_name": "optuna_trial"}
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    cfg = _make_cfg(cfg_dict, device)
+
+    torch.manual_seed(42)
+    np.random.seed(42)
+    model = mVAE(cfg).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+
+    EPOCHS = cfg_dict["epochs"]
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        cfg.current_gumbel_temp = max(
+            cfg.min_gumbel_temp,
+            cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
+
+        if mode == "unsup":
+            _train_epoch_unsup(model, optimizer, loaders["train"], cfg)
+        else:
+            _train_epoch_semisup(model, optimizer,
+                                 loaders["labeled"], loaders["unlabeled"], cfg)
+
+        # Pruning: 每 5 epoch 报告中间值
+        if epoch % 5 == 0:
+            _, mid_acc, _ = evaluate_model(model, loaders["val"], cfg)
+            trial.report(mid_acc, epoch)
+            if trial.should_prune():
+                raise __import__('optuna').TrialPruned()
+
+    # 最终评估
+    _, post_acc, _ = evaluate_model(model, loaders["val"], cfg)
+    xcond = measure_x_conditionality(model, loaders["val"], cfg)
+
+    # 重构损失 (归一化到 [0,1])
+    total_recon, n = 0, 0
+    with torch.no_grad():
+        for y, _ in loaders["val"]:
+            y = y.to(device)
+            _, info = model.forward_unlabeled(y, cfg)
+            total_recon += info['recon']; n += 1
+    recon = total_recon / max(n, 1)
+    # 用 baseline_recon=200 做归一化 (MNIST 随机初始化约 200-250)
+    recon_score = max(0, 1 - recon / 200.0)
+
+    composite = 0.6 * post_acc + 0.2 * xcond + 0.2 * recon_score
+    return composite
+
+
+def run_optuna_search(mode="unsup", n_trials=100, save_dir=None):
+    """
+    Phase 0: 用 Optuna 搜索最优 baseline 超参.
+    结果保存为 JSON, 后续消融实验自动加载.
+    """
+    import optuna
+
+    sd = save_dir or f"mVAE_ablation_{mode}"
+    os.makedirs(sd, exist_ok=True)
+    result_path = os.path.join(sd, "optuna_best.json")
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    tmp_cfg = _make_cfg({**OPTUNA_FIXED, **{k: v[1][0] if v[0] == "categorical"
+                                             else v[1][0]
+                                             for k, v in OPTUNA_SEARCH_SPACE.items()},
+                         "name": "tmp", "display_name": "tmp"}, device)
+    loaders = _load_data(mode, tmp_cfg)
+
+    print(f"\n{'#'*60}")
+    print(f"# Phase 0: Optuna Search ({mode})")
+    print(f"# {n_trials} trials, {OPTUNA_FIXED['epochs']} epochs each")
+    print(f"# Search space: {list(OPTUNA_SEARCH_SPACE.keys())}")
+    print(f"{'#'*60}\n")
+
+    study = optuna.create_study(
+        direction="maximize",
+        study_name=f"mVAE_{mode}",
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=5),
+    )
+
+    study.optimize(
+        lambda trial: _optuna_objective(trial, mode, loaders),
+        n_trials=n_trials,
+        show_progress_bar=True,
+    )
+
+    best = study.best_trial
+    print(f"\n{'='*60}")
+    print(f"Optuna best trial #{best.number}")
+    print(f"  Score:  {best.value:.4f}")
+    print(f"  Params: {json.dumps(best.params, indent=2)}")
+    print(f"{'='*60}")
+
+    # 保存
+    result = {
+        "mode": mode,
+        "best_score": best.value,
+        "best_params": best.params,
+        "n_trials": n_trials,
+        "fixed_params": OPTUNA_FIXED,
+    }
+    with open(result_path, 'w') as f:
+        json.dump(result, f, indent=2)
+    print(f"Saved → {result_path}")
+    print(f"\n下一步: 运行 python mVAE_ablation.py --mode {mode}")
+    print(f"消融实验会自动加载这些最优参数作为 baseline.")
+
+    return best.params
+
+
+def _load_optuna_baseline(save_dir, mode):
+    """尝试加载 Phase 0 的 Optuna 结果, 返回 dict 或 None."""
+    path = os.path.join(save_dir, "optuna_best.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            data = json.load(f)
+        if data.get("mode") == mode:
+            print(f"  ★ Loaded Optuna baseline from {path}")
+            print(f"    Score: {data['best_score']:.4f}")
+            print(f"    Params: {data['best_params']}")
+            return data["best_params"]
+    return None
+
+
+# ==============================================================
 # 配置定义
 # ==============================================================
 
+# 默认 _BASE (可被 Optuna 结果覆盖)
 _BASE = dict(
     latent_dim=2, num_classes=10, beta=2.0,
     z_dropout_rate=0.5, balance_weight=10.0,
@@ -98,6 +265,49 @@ SEMISUP_CONFIGS = {
 }
 
 SEEDS = [42, 123, 2024]
+
+
+def _rebuild_configs_from_base(base):
+    """
+    用给定的 base dict 重新生成所有消融配置.
+    当 Optuna 找到更优的 baseline 时, 调用此函数更新.
+    """
+    def _c(name, display, **kw):
+        d = {**base, "name": name, "display_name": display}
+        d.update(kw)
+        return d
+
+    unsup = {
+        "full_model":       _c("full_model",       "Full model"),
+        "zdim_4":           _c("zdim_4",           "$d_z=4$",              latent_dim=4),
+        "zdim_8":           _c("zdim_8",           "$d_z=8$",              latent_dim=8),
+        "zdim_16":          _c("zdim_16",          "$d_z=16$",             latent_dim=16),
+        "beta_0.5":         _c("beta_0.5",         "$\\beta=0.5$",         beta=0.5),
+        "beta_1.0":         _c("beta_1.0",         "$\\beta=1.0$",         beta=1.0),
+        "beta_4.0":         _c("beta_4.0",         "$\\beta=4.0$",         beta=4.0),
+        "no_z_dropout":     _c("no_z_dropout",     "w/o z-dropout",        z_dropout_rate=0.0),
+        "no_balance":       _c("no_balance",       "w/o balance",          balance_weight=0.0),
+        "no_both_reg":      _c("no_both_reg",      "w/o both reg.",        z_dropout_rate=0.0,
+                                                                            balance_weight=0.0),
+        "decoder_concat":   _c("decoder_concat",   "Concat decoder",       decoder_type="concat"),
+        "K_15":             _c("K_15",             "$K=15$",               num_classes=15),
+        "K_20":             _c("K_20",             "$K=20$",               num_classes=20),
+        "tau_aggressive":   _c("tau_aggressive",   "$\\tau$: aggressive",  tau_min=0.05, tau_rate=0.95),
+        "tau_conservative": _c("tau_conservative", "$\\tau$: conservative", tau_min=0.3, tau_rate=0.99),
+        "dim8_beta1":       _c("dim8_beta1",       "$d_z=8,\\beta=1$",     latent_dim=8, beta=1.0),
+        "dim8_beta0.5":     _c("dim8_beta0.5",     "$d_z=8,\\beta=0.5$",   latent_dim=8, beta=0.5),
+        "dim16_beta0.5":    _c("dim16_beta0.5",    "$d_z=16,\\beta=0.5$",  latent_dim=16, beta=0.5),
+    }
+
+    semisup = {
+        "ss_full":          _c("ss_full",          "SemiSup full"),
+        "ss_alpha_0.1":     _c("ss_alpha_0.1",     "$\\alpha_{un}=0.1$",   alpha_unlabeled=0.1),
+        "ss_alpha_1.0":     _c("ss_alpha_1.0",     "$\\alpha_{un}=1.0$",   alpha_unlabeled=1.0),
+        "ss_label_10":      _c("ss_label_10",      "10 labels/class",      labeled_per_class=10),
+        "ss_label_50":      _c("ss_label_50",      "50 labels/class",      labeled_per_class=50),
+        "ss_label_500":     _c("ss_label_500",     "500 labels/class",     labeled_per_class=500),
+    }
+    return unsup, semisup
 
 
 # ==============================================================
@@ -353,30 +563,60 @@ def _load_data(mode, cfg):
 # 批量运行
 # ==============================================================
 def run_all_experiments(mode="unsup", configs_to_run=None, seeds=None,
-                        save_dir=None):
+                        save_dir=None, quick_epochs=None):
     """
+    Phase 1: 运行消融实验.
+    自动检查是否有 Phase 0 的 Optuna 结果, 有则更新 baseline.
+
     mode: "unsup" | "semisup" | "both"
+    quick_epochs: 若非 None, 强制所有配置用此 epoch 数
     """
+    global UNSUP_CONFIGS, SEMISUP_CONFIGS
+
     if seeds is None:
         seeds = SEEDS
     modes = ["unsup", "semisup"] if mode == "both" else [mode]
     all_results = []
 
     for m in modes:
+        sd = save_dir or f"mVAE_ablation_{m}"
+        os.makedirs(sd, exist_ok=True)
+
+        # ★★ 尝试加载 Optuna baseline → 重建所有配置
+        optuna_params = _load_optuna_baseline(sd, m)
+        if optuna_params:
+            updated_base = {**_BASE}
+            for k, v in optuna_params.items():
+                if k in updated_base:
+                    updated_base[k] = v
+            new_unsup, new_semisup = _rebuild_configs_from_base(updated_base)
+            UNSUP_CONFIGS = new_unsup
+            SEMISUP_CONFIGS = new_semisup
+            print(f"  ★ Configs rebuilt with Optuna baseline:")
+            print(f"    d_z={updated_base['latent_dim']}, β={updated_base['beta']}, "
+                  f"z_drop={updated_base['z_dropout_rate']}, "
+                  f"bal={updated_base['balance_weight']}, lr={updated_base['lr']:.4f}")
+        else:
+            print(f"  (No Optuna baseline found in {sd}, using defaults)")
+
         pool = UNSUP_CONFIGS if m == "unsup" else SEMISUP_CONFIGS
+
+        # quick 模式: 在 Optuna rebuild 之后强制覆盖 epochs
+        if quick_epochs is not None:
+            for c in pool.values():
+                c["epochs"] = quick_epochs
+
         names = configs_to_run or list(pool.keys())
         names = [n for n in names if n in pool]
         if not names:
             print(f"[{m}] No matching configs — skip"); continue
 
-        sd = save_dir or f"mVAE_ablation_{m}"
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         print(f"\n{'#'*60}")
         print(f"# {m.upper()} | {len(names)} configs × {len(seeds)} seeds | {device}")
         print(f"# → {sd}")
         print(f"{'#'*60}")
-        os.makedirs(sd, exist_ok=True)
 
         # 默认 loader (大部分配置共享)
         default_cfg = _make_cfg(list(pool.values())[0], device)
@@ -846,18 +1086,42 @@ def _text_table(rows, save_dir, mode):
 # CLI
 # ==============================================================
 if __name__ == "__main__":
-    pa = argparse.ArgumentParser()
+    pa = argparse.ArgumentParser(description="mVAE Ablation (Phase 0 + Phase 1)")
     pa.add_argument("--mode", default="unsup", choices=["unsup","semisup","both"])
-    pa.add_argument("--plot-only", action="store_true")
-    pa.add_argument("--config", type=str, default=None)
-    pa.add_argument("--seed", type=int, default=None)
+    pa.add_argument("--plot-only", action="store_true",
+                    help="Phase 1: 仅从已有结果出图")
+    pa.add_argument("--config", type=str, default=None,
+                    help="Phase 1: 只跑指定配置")
+    pa.add_argument("--seed", type=int, default=None,
+                    help="Phase 1: 只跑指定种子")
     pa.add_argument("--save-dir", type=str, default=None)
-    pa.add_argument("--quick", action="store_true", help="30 epochs")
+    pa.add_argument("--quick", action="store_true",
+                    help="Phase 1: 30 epochs 快速验证")
+    pa.add_argument("--optuna", action="store_true",
+                    help="Phase 0: 运行 Optuna 搜索最优 baseline")
+    pa.add_argument("--n-trials", type=int, default=100,
+                    help="Phase 0: Optuna trial 数 (default: 100)")
     args = pa.parse_args()
 
+    # ============================================================
+    # Phase 0: Optuna baseline 搜索
+    # ============================================================
+    if args.optuna:
+        modes = ["unsup", "semisup"] if args.mode == "both" else [args.mode]
+        for m in modes:
+            sd = args.save_dir or f"mVAE_ablation_{m}"
+            run_optuna_search(mode=m, n_trials=args.n_trials, save_dir=sd)
+        print("\n✓ Phase 0 完成. 接下来运行消融:")
+        print(f"  python mVAE_ablation.py --mode {args.mode}")
+        sys.exit(0)
+
+    # ============================================================
+    # Phase 1: 消融实验
+    # ============================================================
     if args.quick:
-        for c in UNSUP_CONFIGS.values(): c["epochs"] = 30
-        for c in SEMISUP_CONFIGS.values(): c["epochs"] = 30
+        quick_ep = 30
+    else:
+        quick_ep = None
 
     if args.plot_only:
         for m in (["unsup","semisup"] if args.mode == "both" else [args.mode]):
@@ -870,7 +1134,8 @@ if __name__ == "__main__":
         sds  = [args.seed]   if args.seed  else None
         results = run_all_experiments(
             mode=args.mode, configs_to_run=cfgs,
-            seeds=sds, save_dir=args.save_dir)
+            seeds=sds, save_dir=args.save_dir,
+            quick_epochs=quick_ep)
         for m in (["unsup","semisup"] if args.mode == "both" else [args.mode]):
             sd = args.save_dir or f"mVAE_ablation_{m}"
             mr = [r for r in results if r.get("mode") == m]
