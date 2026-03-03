@@ -70,6 +70,11 @@ OPTUNA_FIXED = dict(
 
 def _optuna_objective(trial, mode, loaders):
     """Optuna 目标函数: 复合得分 = 0.6*acc + 0.2*xcond + 0.2*recon_score"""
+    import warnings
+    # ★★ 抑制 KMeans 对坍缩 z 空间的 ConvergenceWarning
+    from sklearn.exceptions import ConvergenceWarning
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
     params = {}
     for name, (ptype, spec) in OPTUNA_SEARCH_SPACE.items():
         if ptype == "categorical":
@@ -102,12 +107,25 @@ def _optuna_objective(trial, mode, loaders):
             _train_epoch_semisup(model, optimizer,
                                  loaders["labeled"], loaders["unlabeled"], cfg)
 
-        # Pruning: 每 5 epoch 报告中间值
+        # ★★ 退化检测 + Pruning: 每 5 epoch 检查
         if epoch % 5 == 0:
             _, mid_acc, _ = evaluate_model(model, loaders["val"], cfg)
+
+            # 退化: epoch 5 后 acc 还 < 15% (随机水平 = 10%) → 直接剪
+            if epoch >= 5 and mid_acc < 0.15:
+                import optuna
+                raise optuna.TrialPruned(f"Degenerate: acc={mid_acc:.3f} at ep {epoch}")
+
+            # 坍缩检测: pi 最大分量 > 0.8 说明只用了 1-2 个类
+            pi_np = model.pi.detach().cpu().numpy()
+            if pi_np.max() > 0.8:
+                import optuna
+                raise optuna.TrialPruned(f"Collapsed: pi_max={pi_np.max():.3f}")
+
             trial.report(mid_acc, epoch)
             if trial.should_prune():
-                raise __import__('optuna').TrialPruned()
+                import optuna
+                raise optuna.TrialPruned()
 
     # 最终评估
     _, post_acc, _ = evaluate_model(model, loaders["val"], cfg)
@@ -134,6 +152,9 @@ def run_optuna_search(mode="unsup", n_trials=100, save_dir=None):
     结果保存为 JSON, 后续消融实验自动加载.
     """
     import optuna
+    import warnings
+    from sklearn.exceptions import ConvergenceWarning
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
     sd = save_dir or f"mVAE_ablation_{mode}"
     os.makedirs(sd, exist_ok=True)
