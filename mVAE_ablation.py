@@ -4,12 +4,12 @@ mVAE_ablation.py — mVAE 消融实验自动化框架 (unsup + semisup 双模式
 
 两阶段方法论:
   Phase 0: Optuna 搜索 → 找到最优 baseline 超参 (只跑一次)
-  Phase 1: 消融实验   → 固定 baseline, 控制变量 (×3 seeds)
+  Phase 1: 消融实验   → 固定 baseline, 控制变量 (×5 seeds)
 
 功能:
   1. [Phase 0] Optuna 搜索 baseline (可选, --optuna)
   2. [Phase 1] 定义 unsup (18) + semisup (6) 共 24 个消融配置
-  3. 自动运行全部实验 (每个配置 x 3 seeds, 断点续跑)
+  3. 自动运行全部实验 (每个配置 x 5 seeds, 断点续跑)
   4. 生成对比图表和 LaTeX 表格
 
 使用:
@@ -285,7 +285,7 @@ SEMISUP_CONFIGS = {
     "ss_label_500":     _c("ss_label_500",     "500 labels/class",     labeled_per_class=500),
 }
 
-SEEDS = [42, 123, 2024]
+SEEDS = [42, 123, 2024, 7, 314]
 
 
 def _rebuild_configs_from_base(base):
@@ -1118,6 +1118,10 @@ if __name__ == "__main__":
     pa.add_argument("--save-dir", type=str, default=None)
     pa.add_argument("--quick", action="store_true",
                     help="Phase 1: 30 epochs 快速验证")
+    pa.add_argument("--epochs", type=int, default=None,
+                    help="Phase 1: 覆盖 epoch 数 (e.g. --epochs 150)")
+    pa.add_argument("--force", action="store_true",
+                    help="Phase 1: 强制重跑 (删除已有结果)")
     pa.add_argument("--optuna", action="store_true",
                     help="Phase 0: 运行 Optuna 搜索最优 baseline")
     pa.add_argument("--n-trials", type=int, default=100,
@@ -1139,10 +1143,41 @@ if __name__ == "__main__":
     # ============================================================
     # Phase 1: 消融实验
     # ============================================================
+
+    # epoch 覆盖优先级: --quick (30) > --epochs N > config default (100)
     if args.quick:
         quick_ep = 30
+    elif args.epochs:
+        quick_ep = args.epochs
     else:
         quick_ep = None
+
+    # --force: 删除指定配置/seed 的已有结果, 强制重跑
+    if args.force:
+        modes = ["unsup", "semisup"] if args.mode == "both" else [args.mode]
+        for m in modes:
+            sd = args.save_dir or f"mVAE_ablation_{m}"
+            if not os.path.exists(sd):
+                continue
+            cfgs_f = [args.config] if args.config else None
+            seeds_f = [args.seed] if args.seed else SEEDS
+            deleted = 0
+            for d in os.listdir(sd):
+                dp = os.path.join(sd, d)
+                if not os.path.isdir(dp):
+                    continue
+                if cfgs_f and not any(d.startswith(c + "_seed") for c in cfgs_f):
+                    continue
+                if any(d.endswith(f"_seed{s}") for s in seeds_f):
+                    rp = os.path.join(dp, "result.json")
+                    if os.path.exists(rp):
+                        os.remove(rp)
+                        deleted += 1
+            sp = os.path.join(sd, "all_results.json")
+            if os.path.exists(sp):
+                os.remove(sp)
+            if deleted:
+                print(f"  ✗ [{m}] Deleted {deleted} cached results → will re-run")
 
     if args.plot_only:
         for m in (["unsup","semisup"] if args.mode == "both" else [args.mode]):
